@@ -1,0 +1,50 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lumora",
+  "version": "0.1.0",
+  "identifier": "app.lumora.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "dock",
+        "title": "Lumora Dock",
+        "width": 760,
+        "height": 118,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "backgroundColor": [0, 0, 0, 0],
+        "alwaysOnTop": true,
+        "resizable": false,
+        "visible": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "launcher",
+        "title": "Lumora Launcher",
+        "width": 780,
+        "height": 540,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "backgroundColor": [0, 0, 0, 0],
+        "alwaysOnTop": true,
+        "resizable": false,
+        "visible": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
