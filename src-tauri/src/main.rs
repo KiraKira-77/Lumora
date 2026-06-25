@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+};
 
 use tauri::{window::Color, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -37,6 +41,8 @@ struct DockTarget {
     #[serde(rename = "type")]
     item_type: String,
     target: String,
+    #[serde(rename = "iconPath")]
+    icon_path: Option<String>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -120,10 +126,12 @@ fn open_target(target: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn describe_targets(paths: Vec<String>) -> Vec<DockTarget> {
+fn describe_targets(app: tauri::AppHandle, paths: Vec<String>) -> Vec<DockTarget> {
+    let icon_cache_dir = app.path().app_cache_dir().ok().map(|path| path.join("icons"));
+
     paths
         .iter()
-        .map(|path| describe_target(&PathBuf::from(expand_user_path(path))))
+        .map(|path| describe_target_with_icon(&PathBuf::from(expand_user_path(path)), icon_cache_dir.as_deref()))
         .collect()
 }
 
@@ -499,7 +507,12 @@ fn classify_file(name: &str) -> (&'static str, &'static str) {
     }
 }
 
+#[cfg(test)]
 fn describe_target(path: &Path) -> DockTarget {
+    describe_target_with_icon(path, None)
+}
+
+fn describe_target_with_icon(path: &Path, icon_cache_dir: Option<&Path>) -> DockTarget {
     let item_type = if path.is_dir() {
         "folder"
     } else {
@@ -527,7 +540,153 @@ fn describe_target(path: &Path) -> DockTarget {
         label,
         item_type: item_type.to_string(),
         target: path.to_string_lossy().to_string(),
+        icon_path: icon_cache_dir.and_then(|cache_dir| extract_icon_png(path, cache_dir)),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn extract_icon_png(path: &Path, icon_cache_dir: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Graphics::Gdi::{
+            DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS,
+        },
+        Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        UI::{
+            Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON},
+            WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO},
+        },
+    };
+
+    let mut hasher = DefaultHasher::new();
+    path.to_string_lossy().to_lowercase().hash(&mut hasher);
+    let output = icon_cache_dir.join(format!("{:x}.png", hasher.finish()));
+    if output.exists() {
+        return Some(output.to_string_lossy().to_string());
+    }
+
+    let _ = std::fs::create_dir_all(icon_cache_dir);
+
+    let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide_path.push(0);
+
+    let mut shell_info: SHFILEINFOW = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        SHGetFileInfoW(
+            wide_path.as_ptr(),
+            FILE_ATTRIBUTE_NORMAL,
+            &mut shell_info,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+
+    if result == 0 || shell_info.hIcon.is_null() {
+        return None;
+    }
+
+    let icon = shell_info.hIcon;
+    let png_result = unsafe {
+        let mut icon_info: ICONINFO = std::mem::zeroed();
+        if GetIconInfo(icon, &mut icon_info) == 0 {
+            let _ = DestroyIcon(icon);
+            return None;
+        }
+
+        let bitmap_handle = if !icon_info.hbmColor.is_null() {
+            icon_info.hbmColor
+        } else {
+            icon_info.hbmMask
+        };
+
+        if bitmap_handle.is_null() {
+            if !icon_info.hbmColor.is_null() {
+                let _ = DeleteObject(icon_info.hbmColor);
+            }
+            if !icon_info.hbmMask.is_null() {
+                let _ = DeleteObject(icon_info.hbmMask);
+            }
+            let _ = DestroyIcon(icon);
+            return None;
+        }
+
+        let mut bitmap: BITMAP = std::mem::zeroed();
+        let object_size = GetObjectW(
+            bitmap_handle,
+            std::mem::size_of::<BITMAP>() as i32,
+            &mut bitmap as *mut _ as *mut std::ffi::c_void,
+        );
+
+        if object_size == 0 || bitmap.bmWidth <= 0 || bitmap.bmHeight <= 0 {
+            if !icon_info.hbmColor.is_null() {
+                let _ = DeleteObject(icon_info.hbmColor);
+            }
+            if !icon_info.hbmMask.is_null() {
+                let _ = DeleteObject(icon_info.hbmMask);
+            }
+            let _ = DestroyIcon(icon);
+            return None;
+        }
+
+        let width = bitmap.bmWidth as u32;
+        let height = bitmap.bmHeight as u32;
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..std::mem::zeroed()
+            },
+            ..std::mem::zeroed()
+        };
+
+        let mut buffer = vec![0u8; (width * height * 4) as usize];
+        let hdc = GetDC(std::ptr::null_mut());
+        let dib_result = GetDIBits(
+            hdc,
+            bitmap_handle,
+            0,
+            height,
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = ReleaseDC(std::ptr::null_mut(), hdc);
+
+        if !icon_info.hbmColor.is_null() {
+            let _ = DeleteObject(icon_info.hbmColor);
+        }
+        if !icon_info.hbmMask.is_null() {
+            let _ = DeleteObject(icon_info.hbmMask);
+        }
+        let _ = DestroyIcon(icon);
+
+        if dib_result == 0 {
+            return None;
+        }
+
+        let alpha_is_empty = buffer.chunks_exact(4).all(|pixel| pixel[3] == 0);
+        for pixel in buffer.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            if alpha_is_empty {
+                pixel[3] = 255;
+            }
+        }
+
+        image::RgbaImage::from_raw(width, height, buffer)?.save(&output).ok()?;
+        Some(output.to_string_lossy().to_string())
+    };
+
+    png_result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_icon_png(_path: &Path, _icon_cache_dir: &Path) -> Option<String> {
+    None
 }
 
 fn unique_destination(dir: &Path, file_name: &str) -> PathBuf {
@@ -805,5 +964,20 @@ mod tests {
             status,
             ShortcutRegistrationStatus::Unavailable("HotKey already registered".to_string())
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn extract_icon_png_writes_a_cached_png_for_windows_executables() {
+        let dir = temp_test_dir("icon_cache");
+        let exe = std::env::current_exe().expect("current test exe path");
+
+        let icon_path = extract_icon_png(&exe, &dir).expect("extract icon png");
+
+        let metadata = std::fs::metadata(&icon_path).expect("icon png metadata");
+        assert!(metadata.len() > 0);
+        assert_eq!(Path::new(&icon_path).extension().and_then(|value| value.to_str()), Some("png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

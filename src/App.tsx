@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { DockSurface } from "./components/DockSurface";
 import { LauncherSurface } from "./components/LauncherSurface";
 import { addDockItem, type DockItem } from "./lib/dockItems";
+import { bindShortcutSlot, type ShortcutSlotTarget } from "./lib/shortcutSlots";
 import {
   describeNativeTargets,
   hideNativeLauncher,
@@ -9,7 +10,7 @@ import {
   openNativeTarget,
   toggleNativeLauncher,
 } from "./lib/native";
-import { loadDockItems, saveDockItems } from "./lib/storage";
+import { loadDockItems, loadShortcutSlots, saveDockItems, saveShortcutSlots } from "./lib/storage";
 import { getWindowSurface, type WindowSurface } from "./lib/windowSurface";
 
 type AppProps = {
@@ -18,14 +19,24 @@ type AppProps = {
 
 const emptyDropPayload: string[] = [];
 
+type DropDestination =
+  | { type: "dock" }
+  | { type: "shortcut"; key: string };
+
 export default function App({ surface = getWindowSurface() }: AppProps) {
   const [dockItems, setDockItems] = useState<DockItem[]>(() => loadDockItems());
+  const [shortcutSlots, setShortcutSlots] = useState(() => loadShortcutSlots());
   const [isDropHot, setIsDropHot] = useState(false);
+  const dropDestinationRef = useRef<DropDestination>({ type: "dock" });
   const [isPreviewLauncherOpen, setIsPreviewLauncherOpen] = useState(true);
 
   useEffect(() => {
     saveDockItems(dockItems);
   }, [dockItems]);
+
+  useEffect(() => {
+    saveShortcutSlots(shortcutSlots);
+  }, [shortcutSlots]);
 
   const addTargetsToDock = useCallback(async (targets: string[]) => {
     const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
@@ -37,13 +48,40 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     setDockItems((items) => inputs.reduce((next, input) => addDockItem(next, input), items));
   }, []);
 
+  const bindTargetToShortcut = useCallback(async (key: string, targets: string[]) => {
+    const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
+    if (cleanTargets.length === 0) {
+      return;
+    }
+
+    const [input] = await describeNativeTargets([cleanTargets[0]]);
+    if (!input) {
+      return;
+    }
+
+    setShortcutSlots((slots) => bindShortcutSlot(slots, key, input));
+  }, []);
+
+  const handleDroppedTargets = useCallback(
+    (targets: string[]) => {
+      const destination = dropDestinationRef.current;
+      if (destination.type === "shortcut") {
+        void bindTargetToShortcut(destination.key, targets);
+        return;
+      }
+
+      void addTargetsToDock(targets);
+    },
+    [addTargetsToDock, bindTargetToShortcut],
+  );
+
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
     void listenForNativeDrops((paths) => {
       setIsDropHot(false);
-      void addTargetsToDock(paths);
+      handleDroppedTargets(paths);
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -58,7 +96,7 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       disposed = true;
       unlisten?.();
     };
-  }, [addTargetsToDock]);
+  }, [handleDroppedTargets]);
 
   async function handleOpen(item: DockItem) {
     if (item.type === "launcher") {
@@ -72,6 +110,10 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     }
 
     await openNativeTarget(item.target);
+  }
+
+  async function handleOpenTarget(target: ShortcutSlotTarget) {
+    await openNativeTarget(target.target);
   }
 
   function targetsFromBrowserDrop(event: DragEvent<HTMLElement>): string[] {
@@ -100,7 +142,14 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     setIsDropHot(false);
-    void addTargetsToDock(targetsFromBrowserDrop(event));
+    handleDroppedTargets(targetsFromBrowserDrop(event));
+  }
+
+  function handleShortcutDrop(key: string, event: DragEvent<HTMLElement>) {
+    event.preventDefault();
+    setIsDropHot(false);
+    dropDestinationRef.current = { type: "shortcut", key };
+    void bindTargetToShortcut(key, targetsFromBrowserDrop(event));
   }
 
   if (surface === "dock") {
@@ -108,7 +157,12 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       <DockSurface
         dockItems={dockItems}
         isDropHot={isDropHot}
-        onDragStateChange={setIsDropHot}
+        onDragStateChange={(isHot) => {
+          setIsDropHot(isHot);
+          if (isHot) {
+            dropDestinationRef.current = { type: "dock" };
+          }
+        }}
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
       />
@@ -119,10 +173,20 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     return (
       <LauncherSurface
         dockItems={dockItems}
+        shortcutSlots={shortcutSlots}
         isDropHot={isDropHot}
-        onDragStateChange={setIsDropHot}
+        onDragStateChange={(isHot) => {
+          setIsDropHot(isHot);
+          if (isHot) {
+            dropDestinationRef.current = { type: "dock" };
+          }
+        }}
         onDrop={handleDrop}
-        onOpen={(item) => void handleOpen(item)}
+        onShortcutDragEnter={(key) => {
+          dropDestinationRef.current = { type: "shortcut", key };
+        }}
+        onShortcutDrop={handleShortcutDrop}
+        onOpenTarget={(target) => void handleOpenTarget(target)}
         onClose={() => void hideNativeLauncher()}
       />
     );
@@ -133,17 +197,32 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       {isPreviewLauncherOpen ? (
         <LauncherSurface
           dockItems={dockItems}
+          shortcutSlots={shortcutSlots}
           isDropHot={isDropHot}
-          onDragStateChange={setIsDropHot}
+          onDragStateChange={(isHot) => {
+            setIsDropHot(isHot);
+            if (isHot) {
+              dropDestinationRef.current = { type: "dock" };
+            }
+          }}
           onDrop={handleDrop}
-          onOpen={(item) => void handleOpen(item)}
+          onShortcutDragEnter={(key) => {
+            dropDestinationRef.current = { type: "shortcut", key };
+          }}
+          onShortcutDrop={handleShortcutDrop}
+          onOpenTarget={(target) => void handleOpenTarget(target)}
           onClose={() => setIsPreviewLauncherOpen(false)}
         />
       ) : null}
       <DockSurface
         dockItems={dockItems}
         isDropHot={isDropHot}
-        onDragStateChange={setIsDropHot}
+        onDragStateChange={(isHot) => {
+          setIsDropHot(isHot);
+          if (isHot) {
+            dropDestinationRef.current = { type: "dock" };
+          }
+        }}
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
       />

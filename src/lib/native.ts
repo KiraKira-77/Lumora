@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createDockItemInputFromTarget, type NewDockItemInput } from "./dockItems";
 import { classifyDesktopFile, type DesktopCategory } from "./desktopOrganizer";
 
@@ -110,6 +110,14 @@ export async function startNativeWindowDrag(): Promise<void> {
 
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   await getCurrentWindow().startDragging();
+}
+
+export function filePathToAssetSrc(path: string): string {
+  if (!isTauriRuntime()) {
+    return path;
+  }
+
+  return convertFileSrc(path);
 }
 
 export async function describeNativeTargets(targets: string[]): Promise<NewDockItemInput[]> {

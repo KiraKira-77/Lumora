@@ -13,31 +13,31 @@ describe("dock item model", () => {
     expect(items).toHaveLength(2);
     expect(items[0]).toMatchObject({
       id: "launcher",
-      label: "光枢",
       type: "launcher",
       pinned: true,
     });
     expect(items[1]).toMatchObject({
       id: "trash",
-      label: "垃圾桶",
       type: "action",
       pinned: true,
     });
   });
 
-  it("adds a user item before the fixed trash item", () => {
+  it("adds a user item with an optional icon before the fixed trash item", () => {
     const items = createDefaultDockItems();
     const next = addDockItem(items, {
-      label: "项目目录",
+      label: "Projects",
       type: "folder",
       target: "D:\\workspace",
+      iconPath: "C:\\Users\\NEX\\AppData\\Roaming\\Lumora\\icons\\workspace.png",
     });
 
     expect(next).toHaveLength(items.length + 1);
     expect(next[1]).toMatchObject({
-      label: "项目目录",
+      label: "Projects",
       type: "folder",
       target: "D:\\workspace",
+      iconPath: "C:\\Users\\NEX\\AppData\\Roaming\\Lumora\\icons\\workspace.png",
       order: 1,
       pinned: false,
     });
@@ -51,14 +51,14 @@ describe("dock item model", () => {
 
   it("searches by label, type, and target", () => {
     const items = addDockItem(createDefaultDockItems(), {
-      label: "项目目录",
+      label: "Projects",
       type: "folder",
       target: "D:\\workspace\\client-a",
     });
 
-    expect(searchDockItems(items, "项目")).toHaveLength(1);
-    expect(searchDockItems(items, "folder").some((item) => item.label === "项目目录")).toBe(true);
-    expect(searchDockItems(items, "client-a").map((item) => item.label)).toEqual(["项目目录"]);
+    expect(searchDockItems(items, "proj")).toHaveLength(1);
+    expect(searchDockItems(items, "folder").some((item) => item.label === "Projects")).toBe(true);
+    expect(searchDockItems(items, "client-a").map((item) => item.label)).toEqual(["Projects"]);
   });
 
   it("creates a URL dock input from dropped text", () => {

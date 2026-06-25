@@ -7,6 +7,7 @@ export type DockItem = {
   target: string;
   glyph: string;
   tone: string;
+  iconPath?: string;
   order: number;
   pinned: boolean;
   active: boolean;
@@ -16,6 +17,7 @@ export type NewDockItemInput = {
   label: string;
   type: Exclude<DockItemType, "launcher">;
   target: string;
+  iconPath?: string;
 };
 
 export type DroppedTargetKind = "app" | "folder" | "file" | "url";
@@ -65,6 +67,7 @@ export function addDockItem(items: DockItem[], input: NewDockItemInput): DockIte
       target: cleanTarget,
       glyph: glyphForLabel(cleanLabel),
       tone: toneForType(input.type),
+      iconPath: input.iconPath,
       order: insertIndex,
       pinned: false,
       active: false,

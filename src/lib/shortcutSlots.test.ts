@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { createDefaultDockItems } from "./dockItems";
-import { createEmptyShortcutSlots, createShortcutSlotsFromDockItems, keyboardRows, shortcutKeys } from "./shortcutSlots";
+import {
+  bindShortcutSlot,
+  createEmptyShortcutSlots,
+  createShortcutSlotsFromDockItems,
+  keyboardRows,
+  shortcutKeys,
+} from "./shortcutSlots";
 
 describe("shortcutSlots", () => {
   it("uses physical keyboard rows for launcher slots", () => {
@@ -25,5 +31,40 @@ describe("shortcutSlots", () => {
     const slots = createShortcutSlotsFromDockItems(createDefaultDockItems());
 
     expect(slots.every((slot) => slot.target === null)).toBe(true);
+  });
+
+  it("binds a dropped app to one shortcut slot without filling other slots", () => {
+    const slots = bindShortcutSlot(createEmptyShortcutSlots(), "Q", {
+      label: "Notion",
+      type: "app",
+      target: "C:\\Program Files\\Notion\\Notion.exe",
+      iconPath: "C:\\Users\\NEX\\AppData\\Roaming\\Lumora\\icons\\notion.png",
+    });
+
+    expect(slots.find((slot) => slot.key === "Q")?.target).toMatchObject({
+      label: "Notion",
+      type: "app",
+      target: "C:\\Program Files\\Notion\\Notion.exe",
+      iconPath: "C:\\Users\\NEX\\AppData\\Roaming\\Lumora\\icons\\notion.png",
+    });
+    expect(slots.filter((slot) => slot.key !== "Q").every((slot) => slot.target === null)).toBe(true);
+  });
+
+  it("replaces an existing shortcut slot binding", () => {
+    const first = bindShortcutSlot(createEmptyShortcutSlots(), "Q", {
+      label: "Notion",
+      type: "app",
+      target: "C:\\Program Files\\Notion\\Notion.exe",
+    });
+    const next = bindShortcutSlot(first, "Q", {
+      label: "Figma",
+      type: "app",
+      target: "C:\\Program Files\\Figma\\Figma.exe",
+    });
+
+    expect(next.find((slot) => slot.key === "Q")?.target).toMatchObject({
+      label: "Figma",
+      target: "C:\\Program Files\\Figma\\Figma.exe",
+    });
   });
 });

@@ -1,6 +1,8 @@
 import { createDefaultDockItems, sortDockItems, type DockItem } from "./dockItems";
+import { createEmptyShortcutSlots, normalizeShortcutSlots, type ShortcutSlot } from "./shortcutSlots";
 
 const dockStorageKey = "lumora.dock.items.v2";
+const shortcutStorageKey = "lumora.shortcut.slots.v1";
 
 function getBrowserStorage(): Storage | undefined {
   if (typeof window === "undefined") {
@@ -39,6 +41,36 @@ export function saveDockItems(items: DockItem[], storage: Storage | undefined = 
   }
 
   storage.setItem(dockStorageKey, JSON.stringify(sortDockItems(items)));
+}
+
+export function loadShortcutSlots(storage: Storage | undefined = getBrowserStorage()): ShortcutSlot[] {
+  if (!storage) {
+    return createEmptyShortcutSlots();
+  }
+
+  const raw = storage.getItem(shortcutStorageKey);
+  if (!raw) {
+    return createEmptyShortcutSlots();
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as ShortcutSlot[];
+    if (!Array.isArray(parsed)) {
+      return createEmptyShortcutSlots();
+    }
+
+    return normalizeShortcutSlots(parsed);
+  } catch {
+    return createEmptyShortcutSlots();
+  }
+}
+
+export function saveShortcutSlots(slots: ShortcutSlot[], storage: Storage | undefined = getBrowserStorage()): void {
+  if (!storage) {
+    return;
+  }
+
+  storage.setItem(shortcutStorageKey, JSON.stringify(normalizeShortcutSlots(slots)));
 }
 
 function normalizeLoadedDockItems(items: DockItem[]): DockItem[] {

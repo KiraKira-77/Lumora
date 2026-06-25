@@ -2,9 +2,10 @@ import type { DragEvent, MouseEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
 import type { DockItem } from "../lib/dockItems";
 import { searchDockItems } from "../lib/dockItems";
-import { keyboardRows, createEmptyShortcutSlots, type ShortcutSlot } from "../lib/shortcutSlots";
+import { keyboardRows, type ShortcutSlot, type ShortcutSlotTarget } from "../lib/shortcutSlots";
 import {
   hideNativeLauncher,
+  filePathToAssetSrc,
   openNativeTarget,
   searchNativeFiles,
   startNativeWindowDrag,
@@ -13,10 +14,13 @@ import {
 
 type LauncherSurfaceProps = {
   dockItems: DockItem[];
+  shortcutSlots: ShortcutSlot[];
   isDropHot: boolean;
   onDragStateChange: (isHot: boolean) => void;
   onDrop: (event: DragEvent<HTMLElement>) => void;
-  onOpen: (item: DockItem) => void;
+  onShortcutDragEnter: (key: string) => void;
+  onShortcutDrop: (key: string, event: DragEvent<HTMLElement>) => void;
+  onOpenTarget: (target: ShortcutSlotTarget) => void;
   onClose: () => void;
 };
 
@@ -32,10 +36,19 @@ function normalizedShortcutKey(event: KeyboardEvent): string {
   return event.key.toUpperCase();
 }
 
-export function LauncherSurface({ dockItems, isDropHot, onDragStateChange, onDrop, onOpen, onClose }: LauncherSurfaceProps) {
+export function LauncherSurface({
+  dockItems,
+  shortcutSlots,
+  isDropHot,
+  onDragStateChange,
+  onDrop,
+  onShortcutDragEnter,
+  onShortcutDrop,
+  onOpenTarget,
+  onClose,
+}: LauncherSurfaceProps) {
   const [query, setQuery] = useState("");
   const [fileResults, setFileResults] = useState<NativeFileSearchItem[]>([]);
-  const slots = useMemo(() => createEmptyShortcutSlots(), []);
   const dockResults = useMemo(
     () => searchDockItems(dockItems, query).filter((item) => item.type !== "launcher" && item.id !== "trash"),
     [dockItems, query],
@@ -86,21 +99,18 @@ export function LauncherSurface({ dockItems, isDropHot, onDragStateChange, onDro
         return;
       }
 
-      const slot = slots.find((item) => item.key === key);
+      const slot = shortcutSlots.find((item) => item.key === key);
       if (!slot?.target) {
         return;
       }
 
       event.preventDefault();
-      const item = dockItems.find((dockItem) => dockItem.id === slot.target?.id);
-      if (item) {
-        onOpen(item);
-      }
+      onOpenTarget(slot.target);
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [dockItems, onOpen, slots]);
+  }, [onOpenTarget, shortcutSlots]);
 
   function renderSlot(slot: ShortcutSlot) {
     return (
@@ -109,15 +119,31 @@ export function LauncherSurface({ dockItems, isDropHot, onDragStateChange, onDro
         key={slot.key}
         aria-label={`快捷键 ${slot.key}${slot.target ? ` ${slot.target.label}` : ""}`}
         title={slot.target?.label ?? `快捷键 ${slot.key}`}
+        onDragEnter={(event) => {
+          event.stopPropagation();
+          onDragStateChange(true);
+          onShortcutDragEnter(slot.key);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onDrop={(event) => {
+          event.stopPropagation();
+          onShortcutDrop(slot.key, event);
+        }}
         onClick={() => {
-          const item = dockItems.find((dockItem) => dockItem.id === slot.target?.id);
-          if (item) {
-            onOpen(item);
+          if (slot.target) {
+            onOpenTarget(slot.target);
           }
         }}
       >
         <span className="shortcut-badge">{slot.key}</span>
-        {slot.target ? <span className="shortcut-glyph">{slot.target.glyph}</span> : null}
+        {slot.target?.iconPath ? (
+          <img className="shortcut-icon" src={filePathToAssetSrc(slot.target.iconPath)} alt="" aria-hidden="true" />
+        ) : slot.target ? (
+          <span className="shortcut-glyph">{slot.target.glyph}</span>
+        ) : null}
       </button>
     );
   }
@@ -164,7 +190,7 @@ export function LauncherSurface({ dockItems, isDropHot, onDragStateChange, onDro
         <div className="shortcut-board" aria-label="键盘快捷槽">
           {keyboardRows.map((row) => (
             <div className="shortcut-row" key={row.join("")}>
-              {row.map((key) => renderSlot(slots.find((slot) => slot.key === key) ?? { key, target: null }))}
+              {row.map((key) => renderSlot(shortcutSlots.find((slot) => slot.key === key) ?? { key, target: null }))}
             </div>
           ))}
         </div>
@@ -172,8 +198,12 @@ export function LauncherSurface({ dockItems, isDropHot, onDragStateChange, onDro
         {query.trim() ? (
           <div className="launcher-results" aria-label="搜索结果">
             {dockResults.slice(0, 4).map((item) => (
-              <button className="launcher-result" key={item.id} onClick={() => onOpen(item)}>
-                <span className={`result-glyph dock-${item.tone}`}>{item.glyph}</span>
+              <button className="launcher-result" key={item.id} onClick={() => onOpenTarget(item)}>
+                {item.iconPath ? (
+                  <img className="result-icon" src={filePathToAssetSrc(item.iconPath)} alt="" aria-hidden="true" />
+                ) : (
+                  <span className={`result-glyph dock-${item.tone}`}>{item.glyph}</span>
+                )}
                 <span>{item.label}</span>
               </button>
             ))}

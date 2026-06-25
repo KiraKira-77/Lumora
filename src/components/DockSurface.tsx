@@ -2,6 +2,7 @@ import type { DragEvent } from "react";
 import { Fragment } from "react";
 import lumoraLogo from "../assets/lumora-logo-256.png";
 import type { DockItem } from "../lib/dockItems";
+import { filePathToAssetSrc } from "../lib/native";
 
 type DockSurfaceProps = {
   dockItems: DockItem[];
@@ -37,6 +38,8 @@ export function DockSurface({ dockItems, isDropHot, onDragStateChange, onDrop, o
                 <span className="dock-trash-can" aria-hidden="true">
                   <span />
                 </span>
+              ) : item.iconPath ? (
+                <img className="dock-app-icon" src={filePathToAssetSrc(item.iconPath)} alt="" aria-hidden="true" />
               ) : (
                 <span>{item.glyph}</span>
               )}

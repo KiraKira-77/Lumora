@@ -1,8 +1,8 @@
-import type { DockItem } from "./dockItems";
+import type { DockItem, NewDockItemInput } from "./dockItems";
 
 export type ShortcutKey = string;
 
-export type ShortcutSlotTarget = Pick<DockItem, "id" | "label" | "target" | "glyph" | "tone" | "type">;
+export type ShortcutSlotTarget = Pick<DockItem, "id" | "label" | "target" | "glyph" | "tone" | "type" | "iconPath">;
 
 export type ShortcutSlot = {
   key: ShortcutKey;
@@ -38,7 +38,61 @@ export function createShortcutSlotsFromDockItems(items: DockItem[]): ShortcutSlo
           glyph: targets[index].glyph,
           tone: targets[index].tone,
           type: targets[index].type,
+          iconPath: targets[index].iconPath,
         }
       : null,
   }));
+}
+
+export function bindShortcutSlot(slots: ShortcutSlot[], key: ShortcutKey, input: NewDockItemInput): ShortcutSlot[] {
+  const normalizedKey = key.toUpperCase();
+
+  return normalizeShortcutSlots(slots).map((slot) => {
+    if (slot.key !== normalizedKey) {
+      return slot;
+    }
+
+    return {
+      key: slot.key,
+      target: {
+        id: `shortcut_${slot.key}`,
+        label: input.label.trim(),
+        type: input.type,
+        target: input.target.trim(),
+        glyph: glyphForLabel(input.label),
+        tone: toneForType(input.type),
+        iconPath: input.iconPath,
+      },
+    };
+  });
+}
+
+export function normalizeShortcutSlots(slots: ShortcutSlot[]): ShortcutSlot[] {
+  const byKey = new Map(slots.map((slot) => [slot.key.toUpperCase(), slot]));
+
+  return shortcutKeys.map((key) => {
+    const slot = byKey.get(key);
+    return slot ? { key, target: slot.target } : { key, target: null };
+  });
+}
+
+function glyphForLabel(label: string): string {
+  return label.trim().slice(0, 1).toUpperCase() || "?";
+}
+
+function toneForType(type: NewDockItemInput["type"]): string {
+  switch (type) {
+    case "app":
+      return "code";
+    case "folder":
+      return "folder";
+    case "url":
+      return "chrome";
+    case "action":
+      return "organize";
+    case "settings":
+      return "settings";
+    case "file":
+      return "shot";
+  }
 }
