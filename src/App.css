@@ -240,205 +240,197 @@ button {
 .launcher-window-surface {
   width: 100vw;
   height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 18px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
   background: transparent !important;
   pointer-events: none;
 }
 
 .lumora-launcher {
-  width: min(720px, calc(100vw - 36px));
-  padding: 10px 18px 18px;
-  border: 1px solid oklch(98% 0.006 250 / 0.45);
-  border-radius: 22px;
-  color: oklch(24% 0.014 250);
-  background:
-    linear-gradient(180deg, oklch(98% 0.006 250 / 0.72), oklch(91% 0.012 250 / 0.42)),
-    oklch(94% 0.01 250 / 0.32);
-  backdrop-filter: blur(34px) saturate(1.18);
-  box-shadow:
-    inset 0 1px 0 oklch(99% 0.003 250 / 0.62),
-    0 26px 72px oklch(18% 0.02 250 / 0.26);
+  width: 100vw;
+  /* height will be determined by content, and the window resizes to match it */
+  border-radius: 12px;
+  background: rgba(24, 24, 28, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 0 20px rgba(255, 255, 255, 0.02);
+  color: #fff;
   pointer-events: auto;
-  transition: border-color 160ms ease, box-shadow 160ms ease;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .lumora-launcher.is-drop-hot {
-  border-color: oklch(72% 0.13 224 / 0.72);
-  box-shadow:
-    inset 0 1px 0 oklch(99% 0.003 250 / 0.66),
-    0 0 0 2px oklch(72% 0.13 224 / 0.18),
-    0 28px 76px oklch(18% 0.02 250 / 0.28);
+  border-color: rgba(64, 156, 255, 0.8);
 }
 
-.launcher-chrome {
-  height: 28px;
-  display: grid;
-  grid-template-columns: 24px 1fr 24px;
+.launcher-header {
+  display: flex;
   align-items: center;
+  padding: 0 20px;
+  height: 64px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   cursor: grab;
 }
 
-.launcher-chrome:active {
+.launcher-header:active {
   cursor: grabbing;
 }
 
-.launcher-close {
-  width: 13px;
-  height: 13px;
-  display: grid;
-  place-items: center;
-  padding: 0;
-  border-radius: 999px;
-  background: oklch(68% 0.2 29);
-  box-shadow:
-    inset 0 1px 0 oklch(96% 0.04 29 / 0.42),
-    0 0 0 1px oklch(35% 0.08 29 / 0.18);
-  cursor: pointer;
-}
-
-.launcher-close span {
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: oklch(36% 0.08 29 / 0);
-  transition: background 120ms ease;
-}
-
-.launcher-close:hover span {
-  background: oklch(36% 0.08 29 / 0.62);
-}
-
-.launcher-drag-handle {
-  justify-self: center;
-  width: 74px;
-  height: 4px;
-  border-radius: 999px;
-  background: oklch(34% 0.012 250 / 0.18);
+.launcher-search-icon {
+  width: 24px;
+  height: 24px;
+  color: rgba(255, 255, 255, 0.4);
+  margin-right: 14px;
 }
 
 .launcher-search {
-  width: 100%;
-  height: 44px;
-  padding: 0 16px;
-  border: 1px solid oklch(38% 0.014 250 / 0.16);
-  border-radius: 14px;
+  flex: 1;
+  height: 100%;
+  background: transparent;
+  border: none;
   outline: none;
-  background: oklch(98% 0.006 250 / 0.68);
-  color: oklch(24% 0.014 250);
-  font-size: 15px;
-  box-shadow: inset 0 1px 2px oklch(20% 0.016 250 / 0.08);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 400;
+  pointer-events: auto;
 }
 
 .launcher-search::placeholder {
-  color: oklch(38% 0.014 250 / 0.46);
+  color: rgba(255, 255, 255, 0.25);
 }
 
-.launcher-search:focus {
-  border-color: oklch(64% 0.12 224 / 0.64);
+.launcher-body {
+  padding: 20px;
+  min-height: 200px;
 }
 
+/* Shortcut Board */
 .shortcut-board {
   display: grid;
-  gap: 9px;
-  margin-top: 18px;
+  gap: 12px;
 }
 
 .shortcut-row {
   display: flex;
   justify-content: center;
-  gap: 9px;
+  gap: 12px;
 }
 
 .shortcut-slot {
   position: relative;
   width: 56px;
-  height: 52px;
+  height: 56px;
   display: grid;
   place-items: center;
-  border: 1px solid oklch(38% 0.014 250 / 0.12);
-  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
   cursor: pointer;
-  box-shadow: inset 0 1px 0 oklch(99% 0.003 250 / 0.32);
-  transition: transform 150ms cubic-bezier(0.2, 0.8, 0.2, 1), border-color 150ms ease, background 150ms ease;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: all 150ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .shortcut-slot:hover {
-  transform: translateY(-2px);
-  border-color: oklch(38% 0.014 250 / 0.28);
+  transform: translateY(-2px) scale(1.05);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.15);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 4px 12px rgba(0, 0, 0, 0.2);
 }
 
 .shortcut-slot.is-empty {
-  background: oklch(98% 0.006 250 / 0.26);
+  opacity: 0.7;
 }
 
 .shortcut-slot.is-filled {
-  color: oklch(97% 0.006 250);
+  color: #fff;
 }
 
 .shortcut-badge {
   position: absolute;
-  top: 6px;
-  right: 7px;
-  color: oklch(34% 0.014 250 / 0.62);
+  top: 4px;
+  right: 6px;
+  color: rgba(255, 255, 255, 0.3);
   font-size: 10px;
-  font-weight: 760;
+  font-weight: 700;
 }
 
 .shortcut-glyph {
-  font-size: 21px;
-  font-weight: 860;
+  font-size: 22px;
+  font-weight: 700;
 }
 
 .shortcut-icon {
   width: 34px;
   height: 34px;
   object-fit: contain;
-  filter: drop-shadow(0 6px 8px oklch(18% 0.02 250 / 0.18));
+  filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.3));
 }
 
+/* Results */
 .launcher-results {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 16px;
+  gap: 10px;
 }
 
 .launcher-result {
-  min-width: 0;
-  height: 42px;
-  display: grid;
-  grid-template-columns: 30px 1fr;
-  gap: 9px;
+  display: flex;
   align-items: center;
-  padding: 0 10px;
-  border: 1px solid oklch(38% 0.014 250 / 0.1);
-  border-radius: 12px;
-  background: oklch(98% 0.006 250 / 0.28);
-  color: oklch(24% 0.014 250 / 0.9);
+  gap: 14px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
   cursor: pointer;
   text-align: left;
+  transition: all 120ms ease;
 }
 
-.launcher-result span:last-child {
-  min-width: 0;
+.launcher-result:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.result-info {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.result-title {
+  font-size: 15px;
+  font-weight: 500;
+  color: #fff;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.result-subtitle {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
 }
 
 .result-glyph {
-  width: 30px;
-  height: 30px;
+  width: 36px;
+  height: 36px;
   display: grid;
   place-items: center;
-  border-radius: 9px;
-  font-weight: 820;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 18px;
 }
 
 .result-icon {
-  width: 30px;
-  height: 30px;
+  width: 36px;
+  height: 36px;
   object-fit: contain;
 }

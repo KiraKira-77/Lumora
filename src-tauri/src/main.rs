@@ -650,8 +650,67 @@ fn describe_target_with_icon(path: &Path, icon_cache_dir: Option<&Path>) -> Dock
     }
 }
 
+fn resolve_lnk_hicon(path: &std::path::Path) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::HICON> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{CoInitialize, CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    unsafe {
+        let _ = CoInitialize(Some(std::ptr::null_mut()));
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist: IPersistFile = link.cast().ok()?;
+        
+        let mut path_u16: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        persist.Load(PCWSTR(path_u16.as_ptr()), STGM(0)).ok()?;
+        
+        let mut icon_path = [0u16; 1024];
+        let mut icon_index = 0i32;
+        let _ = link.GetIconLocation(&mut icon_path, &mut icon_index);
+        
+        let mut final_path = icon_path;
+        let mut len = final_path.iter().position(|&c| c == 0).unwrap_or(final_path.len());
+        
+        if len == 0 {
+            // Fall back to target path
+            let mut target = [0u16; 1024];
+            let _ = link.GetPath(&mut target, std::ptr::null_mut(), 0);
+            final_path = target;
+            len = final_path.iter().position(|&c| c == 0).unwrap_or(final_path.len());
+        }
+        
+        if len == 0 {
+            return None;
+        }
+        
+        use windows::Win32::UI::Shell::ExtractIconExW;
+        let mut phiconlarge = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
+        let mut phiconsmall = [windows::Win32::UI::WindowsAndMessaging::HICON::default(); 1];
+        
+        let extracted = ExtractIconExW(
+            PCWSTR(final_path.as_ptr()),
+            icon_index,
+            Some(phiconlarge.as_mut_ptr()),
+            Some(phiconsmall.as_mut_ptr()),
+            1
+        );
+        
+        if extracted > 0 && !phiconlarge[0].is_invalid() {
+            if !phiconsmall[0].is_invalid() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(phiconsmall[0]);
+            }
+            // cast to windows_sys HICON
+            return Some(phiconlarge[0].0 as windows_sys::Win32::UI::WindowsAndMessaging::HICON);
+        }
+        if extracted > 0 && !phiconsmall[0].is_invalid() {
+            return Some(phiconsmall[0].0 as windows_sys::Win32::UI::WindowsAndMessaging::HICON);
+        }
+        None
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn extract_icon_png(path: &Path, icon_cache_dir: &Path) -> Option<String> {
+fn extract_icon_png(path: &std::path::Path, icon_cache_dir: &std::path::Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Graphics::Gdi::{
@@ -665,7 +724,7 @@ fn extract_icon_png(path: &Path, icon_cache_dir: &Path) -> Option<String> {
         },
     };
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.to_string_lossy().to_lowercase().hash(&mut hasher);
     let output = icon_cache_dir.join(format!("{:x}.png", hasher.finish()));
     if output.exists() {
@@ -677,22 +736,33 @@ fn extract_icon_png(path: &Path, icon_cache_dir: &Path) -> Option<String> {
     let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide_path.push(0);
 
-    let mut shell_info: SHFILEINFOW = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        SHGetFileInfoW(
-            wide_path.as_ptr(),
-            FILE_ATTRIBUTE_NORMAL,
-            &mut shell_info,
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        )
-    };
-
-    if result == 0 || shell_info.hIcon.is_null() {
-        return None;
+    let mut icon = std::ptr::null_mut();
+    
+    if let Some(ext) = path.extension() {
+        if ext.to_string_lossy().to_lowercase() == "lnk" {
+            if let Some(hicon) = resolve_lnk_hicon(path) {
+                icon = hicon;
+            }
+        }
     }
+    
+    if icon.is_null() {
+        let mut shell_info: SHFILEINFOW = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            SHGetFileInfoW(
+                wide_path.as_ptr(),
+                FILE_ATTRIBUTE_NORMAL,
+                &mut shell_info,
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON,
+            )
+        };
 
-    let icon = shell_info.hIcon;
+        if result == 0 || shell_info.hIcon.is_null() {
+            return None;
+        }
+        icon = shell_info.hIcon;
+    }
     let png_result = unsafe {
         let mut icon_info: ICONINFO = std::mem::zeroed();
         if GetIconInfo(icon, &mut icon_info) == 0 {

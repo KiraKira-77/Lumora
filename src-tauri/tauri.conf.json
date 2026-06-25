@@ -36,7 +36,7 @@
         "shadow": false,
         "backgroundColor": [0, 0, 0, 0],
         "alwaysOnTop": true,
-        "resizable": false,
+        "resizable": true,
         "visible": false,
         "skipTaskbar": true,
         "dragDropEnabled": false
