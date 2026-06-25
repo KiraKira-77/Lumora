@@ -11,6 +11,7 @@ export type DockItem = {
   order: number;
   pinned: boolean;
   active: boolean;
+  originalDesktopPath?: string;
 };
 
 export type NewDockItemInput = {
@@ -18,6 +19,7 @@ export type NewDockItemInput = {
   type: Exclude<DockItemType, "launcher">;
   target: string;
   iconPath?: string;
+  originalDesktopPath?: string;
 };
 
 export type DroppedTargetKind = "app" | "folder" | "file" | "url";
@@ -71,6 +73,7 @@ export function addDockItem(items: DockItem[], input: NewDockItemInput): DockIte
       order: insertIndex,
       pinned: false,
       active: false,
+      originalDesktopPath: input.originalDesktopPath,
     },
     ...sorted.slice(insertIndex),
   ];

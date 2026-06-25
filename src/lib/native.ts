@@ -212,17 +212,66 @@ export async function undoNativeDesktopOrganize(
   return invoke<NativeDesktopUndoResult>("undo_desktop_organize", { movedFiles });
 }
 
-export async function listenForNativeDrops(onDrop: (paths: string[]) => void): Promise<() => void> {
+export async function hideNativeDesktopFile(pathStr: string): Promise<NewDockItemInput> {
+  if (!isTauriRuntime()) {
+    return {
+      label: "Mock",
+      type: "file",
+      target: pathStr,
+    };
+  }
+  return invoke<NewDockItemInput>("hide_desktop_file", { pathStr });
+}
+
+export async function restoreNativeDesktopFile(currentPath: string, originalPath: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  return invoke<void>("restore_desktop_file", { currentPath, originalPath });
+}
+
+type NativeDropOptions = {
+  onEnter?: (paths: string[]) => void;
+  onLeave?: () => void;
+};
+
+export async function listenForNativeDrops(
+  onDrop: (paths: string[]) => void,
+  options: NativeDropOptions = {},
+): Promise<() => void> {
   if (!isTauriRuntime()) {
     return () => {};
   }
 
   const { getCurrentWebview } = await import("@tauri-apps/api/webview");
   return getCurrentWebview().onDragDropEvent((event) => {
-    if (event.payload.type === "drop" && event.payload.paths.length > 0) {
-      onDrop(event.payload.paths);
+    if (event.payload.type === "enter" && event.payload.paths.length > 0) {
+      options.onEnter?.(event.payload.paths);
+      return;
+    }
+
+    if (event.payload.type === "drop") {
+      if (event.payload.paths.length > 0) {
+        onDrop(event.payload.paths);
+      }
+      options.onLeave?.();
+      return;
+    }
+
+    if (event.payload.type === "leave") {
+      options.onLeave?.();
     }
   });
+}
+
+export async function updateDockWindowBounds(dockWidth: number, dockHeight: number): Promise<void> {
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("update_dock_bounds", { width: dockWidth, height: dockHeight });
+  } catch (err: any) {
+    alert("Error updating window size: " + (err.message || String(err)));
+  }
 }
 
 export async function listenForLauncherFocus(onFocus: () => void): Promise<() => void> {

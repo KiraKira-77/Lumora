@@ -43,6 +43,8 @@ struct DockTarget {
     target: String,
     #[serde(rename = "iconPath")]
     icon_path: Option<String>,
+    #[serde(rename = "originalDesktopPath")]
+    original_desktop_path: Option<String>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -128,10 +130,24 @@ fn open_target(target: String) -> Result<String, String> {
 #[tauri::command]
 fn describe_targets(app: tauri::AppHandle, paths: Vec<String>) -> Vec<DockTarget> {
     let icon_cache_dir = app.path().app_cache_dir().ok().map(|path| path.join("icons"));
+    let desktop_root = desktop_path().ok().map(PathBuf::from);
 
     paths
         .iter()
-        .map(|path| describe_target_with_icon(&PathBuf::from(expand_user_path(path)), icon_cache_dir.as_deref()))
+        .map(|path| {
+            let mut pb = PathBuf::from(expand_user_path(path));
+            if pb.is_relative() {
+                if let Some(desktop) = &desktop_root {
+                    let candidate = desktop.join(&pb);
+                    if candidate.exists() {
+                        pb = candidate;
+                    }
+                }
+            }
+            let mut target = describe_target_with_icon(&pb, icon_cache_dir.as_deref());
+            target.original_desktop_path = None;
+            target
+        })
         .collect()
 }
 
@@ -455,6 +471,74 @@ fn default_search_roots() -> Vec<PathBuf> {
     }
 }
 
+#[tauri::command]
+fn hide_desktop_file(app: tauri::AppHandle, path_str: String) -> Result<DockTarget, String> {
+    let mut pb = PathBuf::from(expand_user_path(&path_str));
+    let desktop_root = desktop_path().ok().map(PathBuf::from);
+
+    if pb.is_relative() {
+        if let Some(desktop) = &desktop_root {
+            let candidate = desktop.join(&pb);
+            if candidate.exists() {
+                pb = candidate;
+            }
+        }
+    }
+
+    let icon_cache_dir = app.path().app_cache_dir().ok().map(|path| path.join("icons"));
+    let mut target = describe_target_with_icon(&pb, icon_cache_dir.as_deref());
+
+    if let Some(desktop) = &desktop_root {
+        if let Ok(canon_pb) = pb.canonicalize() {
+            if let Ok(canon_desktop) = desktop.canonicalize() {
+                let target_root_dir = desktop.join("Lumora整理");
+                let hidden_dir = desktop.join(".lumora_dock_hidden");
+                
+                if canon_pb.starts_with(&canon_desktop) && !canon_pb.starts_with(&target_root_dir) && !canon_pb.starts_with(&hidden_dir) {
+                    if std::fs::create_dir_all(&hidden_dir).is_ok() {
+                        let file_name = pb.file_name().unwrap_or_default();
+                        let destination = unique_destination(&hidden_dir, &file_name.to_string_lossy());
+                        if std::fs::rename(&pb, &destination).is_ok() {
+                            #[cfg(target_os = "windows")]
+                            {
+                                use std::os::windows::ffi::OsStrExt;
+                                let wide_path: Vec<u16> = hidden_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+                                unsafe {
+                                    windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                                        wide_path.as_ptr(),
+                                        windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM
+                                    );
+                                }
+                            }
+                            target.original_desktop_path = Some(pb.to_string_lossy().to_string());
+                            target.target = destination.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(target)
+}
+
+#[tauri::command]
+fn restore_desktop_file(current_path: String, original_path: String) -> Result<(), String> {
+    let current_pb = PathBuf::from(expand_user_path(&current_path));
+    let original_pb = PathBuf::from(expand_user_path(&original_path));
+
+    if current_pb.exists() {
+        if let Some(parent) = original_pb.parent() {
+            if std::fs::create_dir_all(parent).is_ok() {
+                let dest = unique_destination(parent, &original_pb.file_name().unwrap_or_default().to_string_lossy());
+                let _ = std::fs::rename(&current_pb, &dest);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn build_counts(files: &[DesktopFile]) -> Vec<DesktopCategoryCount> {
     let categories = [
         ("Images", "图片"),
@@ -507,6 +591,27 @@ fn classify_file(name: &str) -> (&'static str, &'static str) {
     }
 }
 
+#[tauri::command]
+fn update_dock_bounds(app: tauri::AppHandle, width: f64, height: f64) {
+    if let Some(win) = app.get_webview_window("dock") {
+        if let Ok(Some(monitor)) = win.current_monitor() {
+            let scale = monitor.scale_factor();
+            let win_width = width.round();
+            let win_height = height.round();
+            
+            let _ = win.set_size(tauri::LogicalSize::new(win_width, win_height));
+            
+            let screen_w = (monitor.size().width as f64) / scale;
+            let screen_h = (monitor.size().height as f64) / scale;
+            
+            let x = ((screen_w - win_width) / 2.0).round();
+            let y = (screen_h - win_height - 10.0).round();
+            
+            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+        }
+    }
+}
+
 #[cfg(test)]
 fn describe_target(path: &Path) -> DockTarget {
     describe_target_with_icon(path, None)
@@ -541,6 +646,7 @@ fn describe_target_with_icon(path: &Path, icon_cache_dir: Option<&Path>) -> Dock
         item_type: item_type.to_string(),
         target: path.to_string_lossy().to_string(),
         icon_path: icon_cache_dir.and_then(|cache_dir| extract_icon_png(path, cache_dir)),
+        original_desktop_path: None,
     }
 }
 
@@ -867,7 +973,10 @@ fn main() {
             organize_desktop,
             undo_desktop_organize,
             toggle_launcher,
-            hide_launcher
+            hide_launcher,
+            hide_desktop_file,
+            restore_desktop_file,
+            update_dock_bounds
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lumora");

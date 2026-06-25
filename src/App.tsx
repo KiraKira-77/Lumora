@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { DockSurface } from "./components/DockSurface";
 import { LauncherSurface } from "./components/LauncherSurface";
-import { addDockItem, type DockItem } from "./lib/dockItems";
+import { addDockItem, type DockItem, type NewDockItemInput } from "./lib/dockItems";
 import { bindShortcutSlot, type ShortcutSlotTarget } from "./lib/shortcutSlots";
 import {
   describeNativeTargets,
+  hideNativeDesktopFile,
   hideNativeLauncher,
   listenForNativeDrops,
   openNativeTarget,
+  restoreNativeDesktopFile,
   toggleNativeLauncher,
 } from "./lib/native";
 import { loadDockItems, loadShortcutSlots, saveDockItems, saveShortcutSlots } from "./lib/storage";
@@ -27,7 +29,9 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
   const [dockItems, setDockItems] = useState<DockItem[]>(() => loadDockItems());
   const [shortcutSlots, setShortcutSlots] = useState(() => loadShortcutSlots());
   const [isDropHot, setIsDropHot] = useState(false);
+  const [dropPreviewItems, setDropPreviewItems] = useState<NewDockItemInput[]>([]);
   const dropDestinationRef = useRef<DropDestination>({ type: "dock" });
+  const dropPreviewRequestRef = useRef(0);
   const [isPreviewLauncherOpen, setIsPreviewLauncherOpen] = useState(true);
 
   useEffect(() => {
@@ -44,9 +48,24 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       return;
     }
 
-    const inputs = await describeNativeTargets(cleanTargets);
+    const duplicates = cleanTargets.filter(t => {
+      const tLower = t.toLowerCase();
+      return dockItems.some(item => 
+        item.target.toLowerCase() === tLower || 
+        item.target.toLowerCase().endsWith(tLower) ||
+        item.label.toLowerCase() === tLower ||
+        (item.originalDesktopPath && item.originalDesktopPath.toLowerCase().endsWith(tLower))
+      );
+    });
+
+    if (duplicates.length > 0) {
+      alert(`已经存在于 Dock 中，无需重复添加:\n${duplicates.join("\n")}`);
+      return;
+    }
+
+    const inputs = await Promise.all(cleanTargets.map(t => hideNativeDesktopFile(t)));
     setDockItems((items) => inputs.reduce((next, input) => addDockItem(next, input), items));
-  }, []);
+  }, [dockItems]);
 
   const bindTargetToShortcut = useCallback(async (key: string, targets: string[]) => {
     const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
@@ -62,8 +81,36 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     setShortcutSlots((slots) => bindShortcutSlot(slots, key, input));
   }, []);
 
+  const clearDropPreview = useCallback(() => {
+    dropPreviewRequestRef.current += 1;
+    setDropPreviewItems([]);
+  }, []);
+
+  const previewTargetsForDock = useCallback(async (targets: string[]) => {
+    const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
+    if (cleanTargets.length === 0) {
+      clearDropPreview();
+      return;
+    }
+
+    const requestId = dropPreviewRequestRef.current + 1;
+    dropPreviewRequestRef.current = requestId;
+
+    try {
+      const inputs = await describeNativeTargets(cleanTargets.slice(0, 4));
+      if (dropPreviewRequestRef.current === requestId) {
+        setDropPreviewItems(inputs);
+      }
+    } catch {
+      if (dropPreviewRequestRef.current === requestId) {
+        setDropPreviewItems([]);
+      }
+    }
+  }, [clearDropPreview]);
+
   const handleDroppedTargets = useCallback(
     (targets: string[]) => {
+      clearDropPreview();
       const destination = dropDestinationRef.current;
       if (destination.type === "shortcut") {
         void bindTargetToShortcut(destination.key, targets);
@@ -72,17 +119,30 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
 
       void addTargetsToDock(targets);
     },
-    [addTargetsToDock, bindTargetToShortcut],
+    [addTargetsToDock, bindTargetToShortcut, clearDropPreview],
   );
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    void listenForNativeDrops((paths) => {
-      setIsDropHot(false);
-      handleDroppedTargets(paths);
-    })
+    void listenForNativeDrops(
+      (paths) => {
+        setIsDropHot(false);
+        handleDroppedTargets(paths);
+      },
+      {
+        onEnter: (paths) => {
+          setIsDropHot(true);
+          dropDestinationRef.current = { type: "dock" };
+          void previewTargetsForDock(paths);
+        },
+        onLeave: () => {
+          setIsDropHot(false);
+          clearDropPreview();
+        },
+      },
+    )
       .then((nextUnlisten) => {
         if (disposed) {
           nextUnlisten();
@@ -96,7 +156,7 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       disposed = true;
       unlisten?.();
     };
-  }, [handleDroppedTargets]);
+  }, [clearDropPreview, handleDroppedTargets, previewTargetsForDock]);
 
   async function handleOpen(item: DockItem) {
     if (item.type === "launcher") {
@@ -148,23 +208,35 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
   function handleShortcutDrop(key: string, event: DragEvent<HTMLElement>) {
     event.preventDefault();
     setIsDropHot(false);
+    clearDropPreview();
     dropDestinationRef.current = { type: "shortcut", key };
     void bindTargetToShortcut(key, targetsFromBrowserDrop(event));
+  }
+
+  async function handleRemove(item: DockItem) {
+    if (item.originalDesktopPath && item.target) {
+      await restoreNativeDesktopFile(item.target, item.originalDesktopPath);
+    }
+    setDockItems((items) => items.filter((i) => i.id !== item.id));
   }
 
   if (surface === "dock") {
     return (
       <DockSurface
         dockItems={dockItems}
+        dropPreviewItems={dropPreviewItems}
         isDropHot={isDropHot}
         onDragStateChange={(isHot) => {
           setIsDropHot(isHot);
           if (isHot) {
             dropDestinationRef.current = { type: "dock" };
+          } else {
+            clearDropPreview();
           }
         }}
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
+        onRemove={(item) => void handleRemove(item)}
       />
     );
   }
@@ -216,15 +288,19 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       ) : null}
       <DockSurface
         dockItems={dockItems}
+        dropPreviewItems={dropPreviewItems}
         isDropHot={isDropHot}
         onDragStateChange={(isHot) => {
           setIsDropHot(isHot);
           if (isHot) {
             dropDestinationRef.current = { type: "dock" };
+          } else {
+            clearDropPreview();
           }
         }}
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
+        onRemove={(item) => void handleRemove(item)}
       />
     </main>
   );
