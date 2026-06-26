@@ -1,7 +1,7 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use tauri::{window::Color, Emitter, Manager};
@@ -46,6 +46,64 @@ struct DockTarget {
     #[serde(rename = "originalDesktopPath")]
     original_desktop_path: Option<String>,
 }
+
+struct DockHidePlan {
+    original_path: PathBuf,
+    hidden_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaunchIdentity {
+    executable_path: Option<PathBuf>,
+    executable_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunningProcess {
+    executable_path: Option<PathBuf>,
+    executable_name: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct DockItemStatus {
+    target: String,
+    #[serde(rename = "isRunning")]
+    is_running: bool,
+    #[serde(rename = "needsAttention")]
+    needs_attention: bool,
+    #[serde(rename = "attentionSequence")]
+    attention_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DockAttentionEntry {
+    identity: LaunchIdentity,
+    sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct DockAttentionState {
+    entries: Vec<DockAttentionEntry>,
+    next_sequence: u64,
+}
+
+static DOCK_ATTENTION_STATE: OnceLock<Mutex<DockAttentionState>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+struct DockActivationEntry {
+    identity: LaunchIdentity,
+    hwnd: isize,
+}
+
+#[cfg(target_os = "windows")]
+static DOCK_ACTIVATION_STATE: OnceLock<Mutex<Vec<DockActivationEntry>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static LUMORA_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static SHELL_HOOK_MESSAGE: OnceLock<u32> = OnceLock::new();
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct MovedDesktopFile {
@@ -128,22 +186,67 @@ fn open_target(target: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn activate_or_open_target(target: String) -> Result<String, String> {
+    if target.starts_with("lumora://") {
+        return Ok(format!("Handled internal action: {target}"));
+    }
+
+    let cleared_attention = clear_dock_attention_for_target(&target);
+    #[cfg(target_os = "windows")]
+    if cleared_attention {
+        emit_dock_attention_changed();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(identity) = launch_identity_for_target(&target) {
+            let processes = running_processes();
+            if is_tray_managed_launch_identity(&identity) {
+                if try_activate_tray_icon_for_identity(&identity) {
+                    return Ok(format!("Activated {} tray icon", identity.executable_name));
+                }
+            }
+            if should_suppress_open_after_activation_miss(&identity, &processes) {
+                return Ok(format!("{} is running without a safe activation window", identity.executable_name));
+            }
+            if let Some(hwnd) = find_window_for_launch_identity(&identity) {
+                activate_window(hwnd);
+                remember_window_for_launch_identity(identity.clone(), hwnd);
+                return Ok(format!("Activated {}", identity.executable_name));
+            }
+            if let Some(hwnd) = remembered_window_for_launch_identity(&identity) {
+                activate_window(hwnd);
+                return Ok(format!("Activated {}", identity.executable_name));
+            }
+        }
+    }
+
+    open_target(target)
+}
+
+#[tauri::command]
+fn dock_item_statuses(targets: Vec<String>) -> Vec<DockItemStatus> {
+    dock_item_statuses_for_targets(targets)
+}
+
+#[tauri::command]
+fn clear_dock_item_attention(target: String) -> Result<(), String> {
+    if clear_dock_attention_for_target(&target) {
+        #[cfg(target_os = "windows")]
+        emit_dock_attention_changed();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn describe_targets(app: tauri::AppHandle, paths: Vec<String>) -> Vec<DockTarget> {
     let icon_cache_dir = app.path().app_cache_dir().ok().map(|path| path.join("icons"));
-    let desktop_root = desktop_path().ok().map(PathBuf::from);
+    let desktop_roots = desktop_roots();
 
     paths
         .iter()
         .map(|path| {
-            let mut pb = PathBuf::from(expand_user_path(path));
-            if pb.is_relative() {
-                if let Some(desktop) = &desktop_root {
-                    let candidate = desktop.join(&pb);
-                    if candidate.exists() {
-                        pb = candidate;
-                    }
-                }
-            }
+            let pb = resolve_dropped_path(path, &desktop_roots);
             let mut target = describe_target_with_icon(&pb, icon_cache_dir.as_deref());
             target.original_desktop_path = None;
             target
@@ -473,49 +576,18 @@ fn default_search_roots() -> Vec<PathBuf> {
 
 #[tauri::command]
 fn hide_desktop_file(app: tauri::AppHandle, path_str: String) -> Result<DockTarget, String> {
-    let mut pb = PathBuf::from(expand_user_path(&path_str));
     let desktop_root = desktop_path().ok().map(PathBuf::from);
-
-    if pb.is_relative() {
-        if let Some(desktop) = &desktop_root {
-            let candidate = desktop.join(&pb);
-            if candidate.exists() {
-                pb = candidate;
-            }
-        }
-    }
+    let desktop_roots = desktop_roots();
+    let pb = resolve_dropped_path(&path_str, &desktop_roots);
 
     let icon_cache_dir = app.path().app_cache_dir().ok().map(|path| path.join("icons"));
     let mut target = describe_target_with_icon(&pb, icon_cache_dir.as_deref());
 
-    if let Some(desktop) = &desktop_root {
-        if let Ok(canon_pb) = pb.canonicalize() {
-            if let Ok(canon_desktop) = desktop.canonicalize() {
-                let target_root_dir = desktop.join("Lumora整理");
-                let hidden_dir = desktop.join(".lumora_dock_hidden");
-                
-                if canon_pb.starts_with(&canon_desktop) && !canon_pb.starts_with(&target_root_dir) && !canon_pb.starts_with(&hidden_dir) {
-                    if std::fs::create_dir_all(&hidden_dir).is_ok() {
-                        let file_name = pb.file_name().unwrap_or_default();
-                        let destination = unique_destination(&hidden_dir, &file_name.to_string_lossy());
-                        if std::fs::rename(&pb, &destination).is_ok() {
-                            #[cfg(target_os = "windows")]
-                            {
-                                use std::os::windows::ffi::OsStrExt;
-                                let wide_path: Vec<u16> = hidden_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-                                unsafe {
-                                    windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
-                                        wide_path.as_ptr(),
-                                        windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM
-                                    );
-                                }
-                            }
-                            target.original_desktop_path = Some(pb.to_string_lossy().to_string());
-                            target.target = destination.to_string_lossy().to_string();
-                        }
-                    }
-                }
-            }
+    if let Some(hidden_root) = desktop_root.as_deref() {
+        if let Some(plan) = dock_hide_plan(&pb, &desktop_roots, hidden_root) {
+            let destination = move_dock_source_to_hidden(&pb, &plan)?;
+            target.original_desktop_path = Some(plan.original_path.to_string_lossy().to_string());
+            target.target = destination.to_string_lossy().to_string();
         }
     }
 
@@ -527,16 +599,1089 @@ fn restore_desktop_file(current_path: String, original_path: String) -> Result<(
     let current_pb = PathBuf::from(expand_user_path(&current_path));
     let original_pb = PathBuf::from(expand_user_path(&original_path));
 
-    if current_pb.exists() {
-        if let Some(parent) = original_pb.parent() {
-            if std::fs::create_dir_all(parent).is_ok() {
-                let dest = unique_destination(parent, &original_pb.file_name().unwrap_or_default().to_string_lossy());
-                let _ = std::fs::rename(&current_pb, &dest);
+    if !current_pb.exists() {
+        return Err(format!("Dock 隐藏项目不存在: {}", current_pb.to_string_lossy()));
+    }
+
+    let parent = original_pb
+        .parent()
+        .ok_or_else(|| format!("原始桌面路径不可读: {}", original_pb.to_string_lossy()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建原始桌面目录 {}: {error}", parent.to_string_lossy()))?;
+
+    let destination = if original_pb.exists() {
+        let file_name = original_pb
+            .file_name()
+            .ok_or_else(|| format!("原始桌面文件名不可读: {}", original_pb.to_string_lossy()))?;
+        unique_destination(parent, &file_name.to_string_lossy())
+    } else {
+        original_pb
+    };
+
+    std::fs::rename(&current_pb, &destination).map_err(|error| {
+        format!(
+            "无法还原 Dock 项目到桌面: {} -> {}: {error}",
+            current_pb.to_string_lossy(),
+            destination.to_string_lossy()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn dock_item_statuses_for_targets(targets: Vec<String>) -> Vec<DockItemStatus> {
+    #[cfg(target_os = "windows")]
+    let processes = running_processes();
+
+    targets
+        .into_iter()
+        .map(|target| {
+            let mut is_running = false;
+            let mut attention_sequence = 0;
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(identity) = launch_identity_for_target(&target) {
+                    is_running = processes
+                        .iter()
+                        .any(|process| process_matches_launch_identity(process, &identity));
+                    attention_sequence = dock_attention_sequence_for_identity(&identity).unwrap_or(0);
+                }
             }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = &target;
+            }
+
+            DockItemStatus {
+                target,
+                is_running,
+                needs_attention: attention_sequence > 0,
+                attention_sequence,
+            }
+        })
+        .collect()
+}
+
+fn dock_attention_state() -> &'static Mutex<DockAttentionState> {
+    DOCK_ATTENTION_STATE.get_or_init(|| Mutex::new(DockAttentionState::default()))
+}
+
+fn mark_dock_attention(identity: LaunchIdentity) -> u64 {
+    let mut state = dock_attention_state()
+        .lock()
+        .expect("dock attention state lock poisoned");
+    state.next_sequence = state.next_sequence.saturating_add(1);
+    let sequence = state.next_sequence;
+
+    if let Some(entry) = state
+        .entries
+        .iter_mut()
+        .find(|entry| launch_identities_match(&entry.identity, &identity))
+    {
+        entry.identity = identity;
+        entry.sequence = sequence;
+        return sequence;
+    }
+
+    state.entries.push(DockAttentionEntry { identity, sequence });
+    sequence
+}
+
+fn clear_dock_attention(identity: &LaunchIdentity) -> bool {
+    let mut state = dock_attention_state()
+        .lock()
+        .expect("dock attention state lock poisoned");
+    let before = state.entries.len();
+    state
+        .entries
+        .retain(|entry| !launch_identities_match(&entry.identity, identity));
+    before != state.entries.len()
+}
+
+fn clear_dock_attention_for_target(target: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return launch_identity_for_target(target)
+            .as_ref()
+            .is_some_and(clear_dock_attention);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = target;
+        false
+    }
+}
+
+fn dock_attention_sequence_for_identity(identity: &LaunchIdentity) -> Option<u64> {
+    let state = dock_attention_state()
+        .lock()
+        .expect("dock attention state lock poisoned");
+    state
+        .entries
+        .iter()
+        .find(|entry| launch_identities_match(&entry.identity, identity))
+        .map(|entry| entry.sequence)
+}
+
+fn launch_identities_match(a: &LaunchIdentity, b: &LaunchIdentity) -> bool {
+    if let (Some(a_path), Some(b_path)) = (&a.executable_path, &b.executable_path) {
+        if path_eq_ignore_ascii_case(a_path, b_path) {
+            return true;
         }
     }
 
-    Ok(())
+    a.executable_name.eq_ignore_ascii_case(&b.executable_name)
+}
+
+fn extension_is(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn lowercase_file_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+}
+
+fn launch_identity_from_executable_path(path: &Path) -> Option<LaunchIdentity> {
+    if !extension_is(path, "exe") {
+        return None;
+    }
+
+    let mut canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    if canonical_str.starts_with(r"\\?\") {
+        canonical = std::path::PathBuf::from(canonical_str.trim_start_matches(r"\\?\"));
+    }
+
+    Some(LaunchIdentity {
+        executable_path: Some(canonical),
+        executable_name: lowercase_file_name(path)?,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn launch_identity_for_target(target: &str) -> Option<LaunchIdentity> {
+    let path = PathBuf::from(expand_user_path(target));
+
+    if extension_is(&path, "lnk") {
+        return resolve_lnk_target_path(&path).and_then(|target_path| launch_identity_from_executable_path(&target_path));
+    }
+
+    launch_identity_from_executable_path(&path)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_lnk_target_path(path: &Path) -> Option<PathBuf> {
+    resolve_lnk_target_path_with_shell(path).or_else(|| resolve_lnk_target_path_from_link_info(path))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_lnk_target_path_with_shell(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitialize, IPersistFile, CLSCTX_INPROC_SERVER, STGM};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    unsafe {
+        let _ = CoInitialize(Some(std::ptr::null_mut()));
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist: IPersistFile = link.cast().ok()?;
+
+        let path_u16: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        persist.Load(PCWSTR(path_u16.as_ptr()), STGM(0)).ok()?;
+
+        let mut target = [0u16; 32768];
+        let _ = link.GetPath(&mut target, std::ptr::null_mut(), 0);
+        let target = string_from_wide_null_terminated(&target)?;
+
+        if target.trim().is_empty() {
+            return None;
+        }
+
+        Some(PathBuf::from(target))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_lnk_target_path_from_link_info(path: &Path) -> Option<PathBuf> {
+    let lnk = parselnk::Lnk::try_from(path).ok()?;
+    let link_info = lnk.link_info;
+    let candidates = [
+        link_info.local_base_path_unicode,
+        link_info.local_base_path,
+        link_info.common_path_suffix_unicode,
+        link_info.common_path_suffix,
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim_matches(char::from(0)).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .find(|candidate| candidate.extension().is_some())
+}
+
+#[cfg(target_os = "windows")]
+fn string_from_wide_null_terminated(value: &[u16]) -> Option<String> {
+    let len = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+    if len == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&value[..len]))
+}
+
+#[cfg(target_os = "windows")]
+fn running_processes() -> Vec<RunningProcess> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+
+    let mut processes = Vec::new();
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if let Some(name) = string_from_wide_null_terminated(&entry.szExeFile) {
+            processes.push(RunningProcess {
+                executable_path: process_path_for_pid(entry.th32ProcessID),
+                executable_name: name.to_lowercase(),
+            });
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    processes
+}
+
+#[cfg(target_os = "windows")]
+fn process_path_for_pid(pid: u32) -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    if ok == 0 || size == 0 {
+        return None;
+    }
+
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize])))
+}
+
+#[cfg(target_os = "windows")]
+fn process_matches_launch_identity(process: &RunningProcess, identity: &LaunchIdentity) -> bool {
+    if let (Some(process_path), Some(identity_path)) = (&process.executable_path, &identity.executable_path) {
+        if path_eq_ignore_ascii_case(process_path, identity_path) {
+            return true;
+        }
+    }
+
+    process.executable_name.eq_ignore_ascii_case(&identity.executable_name)
+}
+
+fn should_suppress_open_after_activation_miss(identity: &LaunchIdentity, processes: &[RunningProcess]) -> bool {
+    is_tray_managed_launch_identity(identity)
+        && processes
+            .iter()
+            .any(|process| process_matches_launch_identity(process, identity))
+}
+
+fn is_tray_managed_launch_identity(identity: &LaunchIdentity) -> bool {
+    matches!(identity.executable_name.as_str(), "weixin.exe" | "wechat.exe")
+}
+
+fn tray_button_text_matches_launch_identity(text: &str, identity: &LaunchIdentity) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    match identity.executable_name.as_str() {
+        "weixin.exe" | "wechat.exe" => text.contains("微信") && !text.contains("企业微信"),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct TrayToolbarButton {
+    toolbar: windows_sys::Win32::Foundation::HWND,
+    rect: windows_sys::Win32::Foundation::RECT,
+    text: String,
+}
+
+#[cfg(target_os = "windows")]
+fn try_activate_tray_icon_for_identity(identity: &LaunchIdentity) -> bool {
+    let Some(button) = find_tray_icon_button_for_identity(identity) else {
+        return false;
+    };
+
+    click_tray_toolbar_button(&button)
+}
+
+#[cfg(target_os = "windows")]
+fn find_tray_icon_button_for_identity(identity: &LaunchIdentity) -> Option<TrayToolbarButton> {
+    tray_toolbar_buttons()
+        .into_iter()
+        .find(|button| tray_button_text_matches_launch_identity(&button.text, identity))
+}
+
+#[cfg(target_os = "windows")]
+fn tray_toolbar_buttons() -> Vec<TrayToolbarButton> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let windows = &mut *(lparam as *mut Vec<HWND>);
+        let class_name = window_class_name(hwnd);
+        if class_name == "Shell_TrayWnd" || class_name == "NotifyIconOverflowWindow" {
+            windows.push(hwnd);
+        }
+        1
+    }
+
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(Some(enum_window), &mut windows as *mut Vec<HWND> as LPARAM);
+    }
+
+    windows
+        .into_iter()
+        .flat_map(tray_toolbar_buttons_for_window)
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn tray_toolbar_buttons_for_window(window: windows_sys::Win32::Foundation::HWND) -> Vec<TrayToolbarButton> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+
+    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let toolbars = &mut *(lparam as *mut Vec<HWND>);
+        if window_class_name(hwnd) == "ToolbarWindow32" {
+            toolbars.push(hwnd);
+        }
+        1
+    }
+
+    let mut toolbars = Vec::new();
+    unsafe {
+        EnumChildWindows(window, Some(enum_child), &mut toolbars as *mut Vec<HWND> as LPARAM);
+    }
+
+    toolbars
+        .into_iter()
+        .flat_map(read_tray_toolbar_buttons)
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn read_tray_toolbar_buttons(toolbar: windows_sys::Win32::Foundation::HWND) -> Vec<TrayToolbarButton> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+    use windows_sys::Win32::System::Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW};
+
+    const TB_BUTTONCOUNT: u32 = 0x0418;
+    const TB_GETBUTTON: u32 = 0x0417;
+    const TB_GETBUTTONTEXTW: u32 = 0x044B;
+    const TB_GETITEMRECT: u32 = 0x041D;
+    const REMOTE_BYTES: usize = 4096;
+    const BUTTON_OFFSET: usize = 0;
+    const TEXT_OFFSET: usize = 512;
+    const RECT_OFFSET: usize = 2048;
+    const TEXT_BYTES: usize = 1024;
+
+    let count = unsafe { SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0) as i32 };
+    if count <= 0 {
+        return Vec::new();
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(toolbar, &mut pid);
+    }
+    if pid == 0 {
+        return Vec::new();
+    }
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_VM_OPERATION
+                | PROCESS_VM_READ
+                | PROCESS_VM_WRITE
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        return Vec::new();
+    }
+
+    let remote = unsafe {
+        VirtualAllocEx(
+            process,
+            std::ptr::null(),
+            REMOTE_BYTES,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if remote.is_null() {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(process);
+        }
+        return Vec::new();
+    }
+
+    let remote_button = unsafe { (remote as *mut u8).add(BUTTON_OFFSET) } as *mut _;
+    let remote_text = unsafe { (remote as *mut u8).add(TEXT_OFFSET) } as *mut _;
+    let remote_rect = unsafe { (remote as *mut u8).add(RECT_OFFSET) } as *mut _;
+    let mut buttons = Vec::new();
+
+    for index in 0..count {
+        unsafe {
+            SendMessageW(toolbar, TB_GETBUTTON, index as usize, remote_button as isize);
+        }
+
+        let mut button_bytes = [0u8; 64];
+        let mut bytes_read = 0usize;
+        let read_button = unsafe {
+            ReadProcessMemory(
+                process,
+                remote_button,
+                button_bytes.as_mut_ptr() as *mut _,
+                button_bytes.len(),
+                &mut bytes_read,
+            )
+        } != 0;
+        if !read_button || bytes_read < 8 {
+            continue;
+        }
+
+        let id_command = i32::from_le_bytes([
+            button_bytes[4],
+            button_bytes[5],
+            button_bytes[6],
+            button_bytes[7],
+        ]);
+
+        let zero_text = [0u8; TEXT_BYTES];
+        let mut bytes_written = 0usize;
+        unsafe {
+            WriteProcessMemory(
+                process,
+                remote_text,
+                zero_text.as_ptr() as *const _,
+                zero_text.len(),
+                &mut bytes_written,
+            );
+            SendMessageW(toolbar, TB_GETBUTTONTEXTW, id_command as usize, remote_text as isize);
+        }
+
+        let mut text_bytes = [0u8; TEXT_BYTES];
+        let read_text = unsafe {
+            ReadProcessMemory(
+                process,
+                remote_text,
+                text_bytes.as_mut_ptr() as *mut _,
+                text_bytes.len(),
+                &mut bytes_read,
+            )
+        } != 0;
+        if !read_text {
+            continue;
+        }
+        let text = string_from_remote_wide_bytes(&text_bytes);
+
+        let zero_rect = [0u8; std::mem::size_of::<RECT>()];
+        unsafe {
+            WriteProcessMemory(
+                process,
+                remote_rect,
+                zero_rect.as_ptr() as *const _,
+                zero_rect.len(),
+                &mut bytes_written,
+            );
+            SendMessageW(toolbar, TB_GETITEMRECT, index as usize, remote_rect as isize);
+        }
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let read_rect = unsafe {
+            ReadProcessMemory(
+                process,
+                remote_rect,
+                &mut rect as *mut RECT as *mut _,
+                std::mem::size_of::<RECT>(),
+                &mut bytes_read,
+            )
+        } != 0;
+        if !read_rect || text.trim().is_empty() {
+            continue;
+        }
+
+        buttons.push(TrayToolbarButton {
+            toolbar,
+            rect,
+            text,
+        });
+    }
+
+    unsafe {
+        VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        windows_sys::Win32::Foundation::CloseHandle(process);
+    }
+
+    buttons
+}
+
+#[cfg(target_os = "windows")]
+fn string_from_remote_wide_bytes(bytes: &[u8]) -> String {
+    let mut values = Vec::new();
+    for chunk in bytes.chunks_exact(2) {
+        let value = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if value == 0 {
+            break;
+        }
+        values.push(value);
+    }
+
+    String::from_utf16_lossy(&values)
+}
+
+#[cfg(target_os = "windows")]
+fn click_tray_toolbar_button(button: &TrayToolbarButton) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP};
+
+    const MK_LBUTTON: usize = 0x0001;
+
+    let x = (button.rect.left + button.rect.right) / 2;
+    let y = (button.rect.top + button.rect.bottom) / 2;
+    if x <= 0 && y <= 0 {
+        return false;
+    }
+
+    let lparam = ((y & 0xffff) << 16) | (x & 0xffff);
+    unsafe {
+        SendMessageW(button.toolbar, WM_LBUTTONDOWN, MK_LBUTTON, lparam as isize);
+        SendMessageW(button.toolbar, WM_LBUTTONUP, 0, lparam as isize);
+    }
+
+    true
+}
+
+fn path_eq_ignore_ascii_case(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+#[cfg(target_os = "windows")]
+fn find_window_for_launch_identity(identity: &LaunchIdentity) -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    struct WindowSearch {
+        identity: LaunchIdentity,
+        hwnd: HWND,
+        rank: Option<u8>,
+        area: i64,
+    }
+
+    unsafe extern "system" fn enum_window(hwnd: HWND, lparam: isize) -> i32 {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+        let class_name = window_class_name(hwnd);
+        let title = window_title(hwnd);
+        let info = window_activation_info(hwnd, &class_name, &title);
+        let Some(rank) = window_activation_rank_for_info(info) else {
+            return 1;
+        };
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return 1;
+        }
+
+        let search = &mut *(lparam as *mut WindowSearch);
+        let process_path = process_path_for_pid(pid);
+        let process = RunningProcess {
+            executable_name: process_path.as_deref().and_then(lowercase_file_name).unwrap_or_default(),
+            executable_path: process_path,
+        };
+
+        if process_matches_launch_identity(&process, &search.identity) {
+            let area = window_activation_area(info);
+            if is_better_window_candidate(rank, area, search.rank, search.area) {
+                search.hwnd = hwnd;
+                search.rank = Some(rank);
+                search.area = area;
+            }
+        }
+
+        1
+    }
+
+    let mut search = WindowSearch {
+        identity: identity.clone(),
+        hwnd: std::ptr::null_mut(),
+        rank: None,
+        area: 0,
+    };
+
+    unsafe {
+        EnumWindows(Some(enum_window), &mut search as *mut WindowSearch as isize);
+    }
+
+    if search.hwnd.is_null() {
+        None
+    } else {
+        Some(search.hwnd)
+    }
+}
+
+#[cfg(all(target_os = "windows", test))]
+fn window_activation_rank(is_visible: bool, has_owner: bool, class_name: &str, title: &str) -> Option<u8> {
+    window_activation_rank_for_info(WindowActivationInfo {
+        is_visible,
+        is_iconic: false,
+        has_owner,
+        class_name,
+        title,
+        ex_style: 0,
+        cloaked: false,
+        left: 0,
+        top: 0,
+        width: 500,
+        height: 500,
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct WindowActivationInfo<'a> {
+    is_visible: bool,
+    is_iconic: bool,
+    has_owner: bool,
+    class_name: &'a str,
+    title: &'a str,
+    ex_style: u32,
+    cloaked: bool,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(target_os = "windows")]
+fn window_activation_rank_for_info(info: WindowActivationInfo<'_>) -> Option<u8> {
+    if info.has_owner || info.cloaked || activation_ex_style_is_tool_window(info.ex_style) || activation_ex_style_is_transparent(info.ex_style) {
+        return None;
+    }
+
+    if is_ignored_activation_window(info.class_name, info.title) {
+        return None;
+    }
+
+    if info.is_visible {
+        if !info.is_iconic && is_offscreen_icon_placeholder(info) {
+            return None;
+        }
+        return Some(if info.is_iconic { 1 } else { 0 });
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn window_activation_area(info: WindowActivationInfo<'_>) -> i64 {
+    i64::from(info.width.max(0)) * i64::from(info.height.max(0))
+}
+
+#[cfg(target_os = "windows")]
+fn is_better_window_candidate(rank: u8, area: i64, current_rank: Option<u8>, current_area: i64) -> bool {
+    match current_rank {
+        None => true,
+        Some(existing_rank) if rank < existing_rank => true,
+        Some(existing_rank) if rank == existing_rank => area > current_area,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn activation_ex_style_is_tool_window(ex_style: u32) -> bool {
+    (ex_style & windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW) != 0
+}
+
+#[cfg(target_os = "windows")]
+fn activation_ex_style_is_transparent(ex_style: u32) -> bool {
+    (ex_style & windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TRANSPARENT) != 0
+}
+
+#[cfg(target_os = "windows")]
+fn is_ignored_activation_window(class_name: &str, title: &str) -> bool {
+    let class_name = class_name.to_ascii_lowercase();
+    let title = title.to_ascii_lowercase();
+
+    title.trim().is_empty()
+        || title.contains("图片和视频")
+        || title.contains("photos and videos")
+        || class_name.contains("trayiconmessage")
+        || class_name.contains("powermessagewindow")
+        || class_name.contains("systemmessagewindow")
+        || class_name.contains("ime")
+        || class_name.contains("sogou")
+        || class_name.contains("sopy_")
+        || class_name.contains("qwindowtoolsavebits")
+}
+
+#[cfg(target_os = "windows")]
+fn is_offscreen_icon_placeholder(info: WindowActivationInfo<'_>) -> bool {
+    if !info.is_visible {
+        return false;
+    }
+
+    info.left < -10_000 || info.top < -10_000 || info.width < 10 || info.height < 10
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn window_activation_info<'a>(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    class_name: &'a str,
+    title: &'a str,
+) -> WindowActivationInfo<'a> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_OWNER,
+    };
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let has_rect = GetWindowRect(hwnd, &mut rect) != 0;
+
+    WindowActivationInfo {
+        is_visible: IsWindowVisible(hwnd) != 0,
+        is_iconic: IsIconic(hwnd) != 0,
+        has_owner: !GetWindow(hwnd, GW_OWNER).is_null(),
+        class_name,
+        title,
+        ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE) as u32,
+        cloaked: window_is_cloaked(hwnd),
+        left: if has_rect { rect.left } else { 0 },
+        top: if has_rect { rect.top } else { 0 },
+        width: if has_rect { rect.right - rect.left } else { 0 },
+        height: if has_rect { rect.bottom - rect.top } else { 0 },
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_is_cloaked(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+
+    let mut cloaked = 0i32;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as u32,
+            &mut cloaked as *mut i32 as *mut _,
+            std::mem::size_of::<i32>() as u32,
+        )
+    } == 0;
+
+    ok && cloaked != 0
+}
+
+#[cfg(target_os = "windows")]
+fn dock_activation_state() -> &'static Mutex<Vec<DockActivationEntry>> {
+    DOCK_ACTIVATION_STATE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(target_os = "windows")]
+fn remember_window_for_launch_identity(identity: LaunchIdentity, hwnd: windows_sys::Win32::Foundation::HWND) {
+    if hwnd.is_null() || !window_is_rememberable_activation_candidate(hwnd, &identity) {
+        return;
+    }
+
+    let mut state = dock_activation_state()
+        .lock()
+        .expect("dock activation state lock poisoned");
+    state.retain(|entry| !launch_identities_match(&entry.identity, &identity));
+    state.push(DockActivationEntry {
+        identity,
+        hwnd: hwnd as isize,
+    });
+    if state.len() > 64 {
+        let overflow = state.len() - 64;
+        state.drain(0..overflow);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn remembered_window_for_launch_identity(identity: &LaunchIdentity) -> Option<windows_sys::Win32::Foundation::HWND> {
+    let remembered = {
+        let state = dock_activation_state()
+            .lock()
+            .expect("dock activation state lock poisoned");
+        state
+            .iter()
+            .rev()
+            .find(|entry| launch_identities_match(&entry.identity, identity))
+            .map(|entry| entry.hwnd)
+    }?;
+
+    let hwnd = remembered as windows_sys::Win32::Foundation::HWND;
+    if window_is_rememberable_activation_candidate(hwnd, identity) {
+        Some(hwnd)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn window_is_rememberable_activation_candidate(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    identity: &LaunchIdentity,
+) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 {
+        return false;
+    }
+
+    let Some(window_identity) = launch_identity_for_window(hwnd) else {
+        return false;
+    };
+    if !launch_identities_match(&window_identity, identity) {
+        return false;
+    }
+
+    unsafe {
+        let class_name = window_class_name(hwnd);
+        let title = window_title(hwnd);
+        let info = window_activation_info(hwnd, &class_name, &title);
+
+        window_activation_rank_for_info(info).is_some()
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn window_title(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+
+    let mut buffer = vec![0u16; 512];
+    let len = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if len <= 0 {
+        return String::new();
+    }
+
+    String::from_utf16_lossy(&buffer[..len as usize])
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn window_class_name(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    let mut buffer = vec![0u16; 256];
+    let len = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if len <= 0 {
+        return String::new();
+    }
+
+    String::from_utf16_lossy(&buffer[..len as usize])
+}
+
+#[cfg(target_os = "windows")]
+fn activate_window(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindowAsync, GetForegroundWindow, SW_MINIMIZE,
+    };
+
+    unsafe {
+        if GetForegroundWindow() == hwnd {
+            ShowWindowAsync(hwnd, SW_MINIMIZE);
+            return;
+        }
+
+        let show_command = activation_show_command(IsIconic(hwnd) != 0, IsWindowVisible(hwnd) != 0);
+        ShowWindowAsync(hwnd, show_command);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn activation_show_command(is_iconic: bool, is_visible: bool) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW};
+
+    if is_iconic || !is_visible {
+        SW_RESTORE
+    } else {
+        SW_SHOW
+    }
+}
+
+#[cfg(target_os = "windows")]
+const HSHELL_FLASH_EVENT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::HSHELL_REDRAW
+    | windows_sys::Win32::UI::WindowsAndMessaging::HSHELL_HIGHBIT;
+
+#[cfg(target_os = "windows")]
+const HSHELL_RUDEAPPACTIVATED_EVENT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::HSHELL_WINDOWACTIVATED
+    | windows_sys::Win32::UI::WindowsAndMessaging::HSHELL_HIGHBIT;
+
+#[cfg(target_os = "windows")]
+fn register_dock_shell_hook(app: &tauri::AppHandle) {
+    use windows_sys::Win32::UI::{
+        Shell::SetWindowSubclass,
+        WindowsAndMessaging::RegisterShellHookWindow,
+    };
+
+    let _ = LUMORA_APP_HANDLE.set(app.clone());
+
+    let Some(window) = app.get_webview_window(dock_window_label()) else {
+        return;
+    };
+
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+
+    unsafe {
+        let _ = SetWindowSubclass(hwnd, Some(dock_shell_hook_proc), 1, 0);
+        let registered = RegisterShellHookWindow(hwnd) != 0;
+        if !registered {
+            eprintln!("Lumora failed to register shell hook window");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_dock_shell_hook<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn dock_shell_hook_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _uid_subclass: usize,
+    _ref_data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::Shell::DefSubclassProc;
+
+    if msg == shell_hook_message() {
+        handle_shell_hook(wparam as u32, lparam as windows_sys::Win32::Foundation::HWND);
+    }
+
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+fn shell_hook_message() -> u32 {
+    *SHELL_HOOK_MESSAGE.get_or_init(|| {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
+
+        let message_name: Vec<u16> = std::ffi::OsStr::new("SHELLHOOK")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe { RegisterWindowMessageW(message_name.as_ptr()) }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn handle_shell_hook(code: u32, hwnd: windows_sys::Win32::Foundation::HWND) {
+    match code {
+        HSHELL_FLASH_EVENT => {
+            if let Some(identity) = launch_identity_for_window(hwnd) {
+                mark_dock_attention(identity);
+                emit_dock_attention_changed();
+            }
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::HSHELL_WINDOWACTIVATED
+        | HSHELL_RUDEAPPACTIVATED_EVENT => {
+            if let Some(identity) = launch_identity_for_window(hwnd) {
+                remember_window_for_launch_identity(identity.clone(), hwnd);
+                if clear_dock_attention(&identity) {
+                    emit_dock_attention_changed();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn launch_identity_for_window(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<LaunchIdentity> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    if hwnd.is_null() {
+        return None;
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+
+    if pid == 0 {
+        return None;
+    }
+
+    let executable_path = process_path_for_pid(pid)?;
+    Some(LaunchIdentity {
+        executable_name: lowercase_file_name(&executable_path)?,
+        executable_path: Some(executable_path),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn emit_dock_attention_changed() {
+    if let Some(app) = LUMORA_APP_HANDLE.get() {
+        let _ = app.emit("lumora://dock-attention-changed", ());
+    }
 }
 
 fn build_counts(files: &[DesktopFile]) -> Vec<DesktopCategoryCount> {
@@ -563,6 +1708,101 @@ fn build_counts(files: &[DesktopFile]) -> Vec<DesktopCategoryCount> {
 fn desktop_path() -> Result<String, String> {
     let user_profile = std::env::var("USERPROFILE").map_err(|_| "USERPROFILE is not set".to_string())?;
     Ok(format!("{user_profile}\\Desktop"))
+}
+
+fn common_desktop_path() -> Option<PathBuf> {
+    std::env::var("PUBLIC")
+        .ok()
+        .map(PathBuf::from)
+        .map(|path| path.join("Desktop"))
+        .filter(|path| path.exists())
+}
+
+fn desktop_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(desktop) = desktop_path() {
+        roots.push(PathBuf::from(desktop));
+    }
+
+    if let Some(common_desktop) = common_desktop_path() {
+        roots.push(common_desktop);
+    }
+
+    roots
+}
+
+fn resolve_dropped_path(target: &str, desktop_roots: &[PathBuf]) -> PathBuf {
+    let path = PathBuf::from(expand_user_path(target));
+    if !path.is_relative() {
+        return path;
+    }
+
+    for desktop in desktop_roots {
+        let candidate = desktop.join(&path);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    path
+}
+
+fn dock_hide_plan(source: &Path, desktop_roots: &[PathBuf], hidden_root: &Path) -> Option<DockHidePlan> {
+    let original_path = source.to_path_buf();
+    let source = source.canonicalize().ok()?;
+    let hidden_dir = hidden_root.join(".lumora_dock_hidden");
+    let canonical_hidden_dir = hidden_dir.canonicalize().unwrap_or_else(|_| hidden_dir.clone());
+
+    for desktop in desktop_roots {
+        let canonical_desktop = desktop.canonicalize().ok()?;
+        let target_root_dir = desktop.join("Lumora整理");
+        let canonical_target_root_dir = target_root_dir.canonicalize().unwrap_or(target_root_dir);
+
+        if source.starts_with(&canonical_desktop)
+            && !source.starts_with(&canonical_target_root_dir)
+            && !source.starts_with(&canonical_hidden_dir)
+        {
+            return Some(DockHidePlan {
+                original_path,
+                hidden_dir,
+            });
+        }
+    }
+
+    None
+}
+
+fn move_dock_source_to_hidden(source: &Path, plan: &DockHidePlan) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(&plan.hidden_dir)
+        .map_err(|error| format!("无法创建 Dock 隐藏目录 {}: {error}", plan.hidden_dir.to_string_lossy()))?;
+
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| format!("桌面项目文件名不可读: {}", source.to_string_lossy()))?;
+    let destination = unique_destination(&plan.hidden_dir, &file_name.to_string_lossy());
+
+    std::fs::rename(source, &destination).map_err(|error| {
+        format!(
+            "无法把桌面项目移动到 Dock 隐藏目录: {} -> {}: {error}",
+            source.to_string_lossy(),
+            destination.to_string_lossy()
+        )
+    })?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide_path: Vec<u16> = plan.hidden_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                wide_path.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM
+            );
+        }
+    }
+
+    Ok(destination)
 }
 
 fn expand_user_path(target: &str) -> String {
@@ -661,7 +1901,7 @@ fn resolve_lnk_hicon(path: &std::path::Path) -> Option<windows_sys::Win32::UI::W
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         let persist: IPersistFile = link.cast().ok()?;
         
-        let mut path_u16: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let path_u16: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         persist.Load(PCWSTR(path_u16.as_ptr()), STGM(0)).ok()?;
         
         let mut icon_path = [0u16; 1024];
@@ -1032,11 +2272,15 @@ fn main() {
             let _ = hide_launcher_window(app.handle());
             position_dock_window(app.handle());
             let _ = register_launcher_shortcut(app.handle());
+            register_dock_shell_hook(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
             open_target,
+            activate_or_open_target,
+            dock_item_statuses,
+            clear_dock_item_attention,
             describe_targets,
             scan_desktop,
             search_files,
@@ -1158,5 +2402,377 @@ mod tests {
         assert_eq!(Path::new(&icon_path).extension().and_then(|value| value.to_str()), Some("png"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_dropped_path_checks_common_desktop_for_relative_shortcuts() {
+        let user_desktop = temp_test_dir("user_desktop");
+        let common_desktop = temp_test_dir("common_desktop");
+        let common_shortcut = common_desktop.join("TencentVideo.lnk");
+        std::fs::write(&common_shortcut, b"shortcut").expect("write common desktop shortcut");
+
+        let resolved = resolve_dropped_path(
+            "TencentVideo.lnk",
+            &[user_desktop.clone(), common_desktop.clone()],
+        );
+
+        assert_eq!(resolved, common_shortcut);
+        let _ = std::fs::remove_dir_all(&user_desktop);
+        let _ = std::fs::remove_dir_all(&common_desktop);
+    }
+
+    #[test]
+    fn dock_hide_plan_accepts_files_from_common_desktop() {
+        let user_desktop = temp_test_dir("hide_user_desktop");
+        let common_desktop = temp_test_dir("hide_common_desktop");
+        let common_shortcut = common_desktop.join("TencentQQ.lnk");
+        std::fs::write(&common_shortcut, b"shortcut").expect("write common desktop shortcut");
+
+        let plan = dock_hide_plan(
+            &common_shortcut,
+            &[user_desktop.clone(), common_desktop.clone()],
+            &user_desktop,
+        )
+        .expect("common desktop shortcut should be hideable");
+
+        assert_eq!(plan.original_path, common_shortcut);
+        assert_eq!(plan.hidden_dir, user_desktop.join(".lumora_dock_hidden"));
+
+        let _ = std::fs::remove_dir_all(&user_desktop);
+        let _ = std::fs::remove_dir_all(&common_desktop);
+    }
+
+    #[test]
+    fn move_dock_source_to_hidden_moves_the_desktop_file() {
+        let user_desktop = temp_test_dir("move_hide_user_desktop");
+        let common_desktop = temp_test_dir("move_hide_common_desktop");
+        let source = common_desktop.join("TencentQQ.lnk");
+        std::fs::write(&source, b"shortcut").expect("write desktop shortcut");
+        let plan = DockHidePlan {
+            original_path: source.clone(),
+            hidden_dir: user_desktop.join(".lumora_dock_hidden"),
+        };
+
+        let destination = move_dock_source_to_hidden(&source, &plan).expect("move desktop shortcut to hidden dir");
+
+        assert!(!source.exists());
+        assert!(destination.exists());
+        assert_eq!(destination.parent(), Some(plan.hidden_dir.as_path()));
+
+        let _ = std::fs::remove_dir_all(&user_desktop);
+        let _ = std::fs::remove_dir_all(&common_desktop);
+    }
+
+    #[test]
+    fn restore_desktop_file_moves_hidden_file_back_to_original_path() {
+        let dir = temp_test_dir("restore_dock_source");
+        let hidden_dir = dir.join(".lumora_dock_hidden");
+        std::fs::create_dir_all(&hidden_dir).expect("create hidden dir");
+        let hidden_file = hidden_dir.join("TencentQQ.lnk");
+        let original_file = dir.join("TencentQQ.lnk");
+        std::fs::write(&hidden_file, b"shortcut").expect("write hidden shortcut");
+
+        restore_desktop_file(
+            hidden_file.to_string_lossy().to_string(),
+            original_file.to_string_lossy().to_string(),
+        )
+        .expect("restore hidden shortcut");
+
+        assert!(!hidden_file.exists());
+        assert!(original_file.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_desktop_file_errors_when_hidden_file_is_missing() {
+        let dir = temp_test_dir("restore_missing_dock_source");
+        let missing_hidden_file = dir.join(".lumora_dock_hidden").join("TencentQQ.lnk");
+        let original_file = dir.join("TencentQQ.lnk");
+
+        let result = restore_desktop_file(
+            missing_hidden_file.to_string_lossy().to_string(),
+            original_file.to_string_lossy().to_string(),
+        );
+
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_identity_from_exe_target_uses_lowercase_process_name() {
+        let identity = launch_identity_from_executable_path(Path::new(r"C:\Program Files\Tencent\WeChat\WeChat.exe"))
+            .expect("exe target should produce a launch identity");
+
+        assert_eq!(identity.executable_name, "wechat.exe");
+        assert_eq!(
+            identity.executable_path,
+            Some(PathBuf::from(r"C:\Program Files\Tencent\WeChat\WeChat.exe"))
+        );
+    }
+
+    #[test]
+    fn running_wechat_suppresses_open_after_activation_miss() {
+        let identity = launch_identity_from_executable_path(Path::new(r"D:\software\Weixin\Weixin.exe"))
+            .expect("weixin identity");
+        let processes = vec![RunningProcess {
+            executable_path: Some(PathBuf::from(r"D:\software\Weixin\Weixin.exe")),
+            executable_name: "weixin.exe".to_string(),
+        }];
+
+        assert!(should_suppress_open_after_activation_miss(&identity, &processes));
+    }
+
+    #[test]
+    fn non_tray_apps_still_open_after_activation_miss() {
+        let identity = launch_identity_from_executable_path(Path::new(r"C:\Tools\Notepad.exe"))
+            .expect("notepad identity");
+        let processes = vec![RunningProcess {
+            executable_path: Some(PathBuf::from(r"C:\Tools\Notepad.exe")),
+            executable_name: "notepad.exe".to_string(),
+        }];
+
+        assert!(!should_suppress_open_after_activation_miss(&identity, &processes));
+    }
+
+    #[test]
+    fn wechat_tray_text_matches_personal_wechat_but_not_enterprise_wechat() {
+        let identity = launch_identity_from_executable_path(Path::new(r"D:\software\Weixin\Weixin.exe"))
+            .expect("weixin identity");
+
+        assert!(tray_button_text_matches_launch_identity("微信", &identity));
+        assert!(tray_button_text_matches_launch_identity("微信: 八月", &identity));
+        assert!(!tray_button_text_matches_launch_identity("企业微信: 杨宽", &identity));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_lnk_target_path_reads_link_info_when_shell_get_path_is_empty() {
+        let dir = temp_test_dir("link_info_lnk");
+        let shortcut = dir.join("Weixin.lnk");
+        let target = r"D:\software\Weixin\Weixin.exe";
+        write_link_info_only_shortcut(&shortcut, target);
+
+        let resolved = resolve_lnk_target_path(&shortcut).expect("resolve link info target");
+
+        assert_eq!(resolved, PathBuf::from(target));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_titled_qt_windows_are_not_guessed_as_activation_candidates() {
+        assert_eq!(window_activation_rank(false, false, "Qt51514QWindowIcon", "Weixin"), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tool_windows_are_not_activation_candidates() {
+        assert_eq!(
+            window_activation_rank_for_info(WindowActivationInfo {
+                is_visible: true,
+                is_iconic: false,
+                has_owner: false,
+                class_name: "Qt51514QWindowToolSaveBits",
+                title: "Weixin",
+                ex_style: windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+                cloaked: false,
+                left: 72,
+                top: 64,
+                width: 1563,
+                height: 871,
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn wechat_media_windows_are_not_activation_candidates() {
+        assert_eq!(
+            window_activation_rank_for_info(WindowActivationInfo {
+                is_visible: true,
+                is_iconic: false,
+                has_owner: false,
+                class_name: "Qt51514QWindowIcon",
+                title: "图片和视频",
+                ex_style: 0,
+                cloaked: false,
+                left: 65,
+                top: 23,
+                width: 1578,
+                height: 919,
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn minimized_offscreen_windows_are_activation_candidates() {
+        assert_eq!(
+            window_activation_rank_for_info(WindowActivationInfo {
+                is_visible: true,
+                is_iconic: true,
+                has_owner: false,
+                class_name: "Qt51514QWindowIcon",
+                title: "Weixin",
+                ex_style: 0,
+                cloaked: false,
+                left: -21333,
+                top: -21333,
+                width: 158,
+                height: 26,
+            }),
+            Some(1)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn offscreen_non_minimized_placeholders_are_not_activation_candidates() {
+        assert_eq!(
+            window_activation_rank_for_info(WindowActivationInfo {
+                is_visible: true,
+                is_iconic: false,
+                has_owner: false,
+                class_name: "Qt51514QWindowIcon",
+                title: "Weixin",
+                ex_style: 0,
+                cloaked: false,
+                left: -21333,
+                top: -21333,
+                width: 158,
+                height: 26,
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_large_wechat_windows_are_not_activation_candidates() {
+        assert_eq!(
+            window_activation_rank_for_info(WindowActivationInfo {
+                is_visible: false,
+                is_iconic: false,
+                has_owner: false,
+                class_name: "Qt51514QWindowIcon",
+                title: "微信",
+                ex_style: 0,
+                cloaked: false,
+                left: 448,
+                top: 171,
+                width: 849,
+                height: 669,
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_message_and_input_windows_are_not_activation_candidates() {
+        assert_eq!(window_activation_rank(false, false, "Chrome_SystemMessageWindow", ""), None);
+        assert_eq!(
+            window_activation_rank(false, false, "Qt51514WxTrayIconMessageWindowClass", "WxTrayIconMessageWindow"),
+            None
+        );
+        assert_eq!(window_activation_rank(false, true, "Qt51514QWindowIcon", "Weixin"), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hidden_windows_restore_instead_of_plain_show() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW};
+
+        assert_eq!(activation_show_command(false, false), SW_RESTORE);
+        assert_eq!(activation_show_command(false, true), SW_SHOW);
+        assert_eq!(activation_show_command(true, true), SW_RESTORE);
+    }
+
+    #[test]
+    fn dock_item_statuses_preserve_unresolved_targets_as_not_running() {
+        let statuses = dock_item_statuses_for_targets(vec!["lumora://trash".to_string()]);
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].target, "lumora://trash");
+        assert!(!statuses[0].is_running);
+        assert!(!statuses[0].needs_attention);
+    }
+
+    #[test]
+    fn dock_item_statuses_reflect_and_clear_attention_by_launch_identity() {
+        let target = r"C:\Program Files\Tencent\WeChat\WeChat.exe".to_string();
+        let identity = launch_identity_from_executable_path(Path::new(&target)).expect("exe target identity");
+
+        mark_dock_attention(identity);
+        let statuses = dock_item_statuses_for_targets(vec![target.clone()]);
+
+        assert_eq!(statuses[0].target, target);
+        assert!(statuses[0].needs_attention);
+        assert!(statuses[0].attention_sequence > 0);
+
+        clear_dock_attention_for_target(&target);
+        let statuses = dock_item_statuses_for_targets(vec![target]);
+
+        assert!(!statuses[0].needs_attention);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn write_link_info_only_shortcut(path: &Path, target: &str) {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let target_bytes = target.as_bytes();
+        let volume_id_size = 16u32;
+        let local_base_path_offset = 0x1c + volume_id_size;
+        let common_path_suffix_offset = local_base_path_offset + target_bytes.len() as u32 + 1;
+        let link_info_size = common_path_suffix_offset + 1;
+        let mut bytes = Vec::new();
+
+        push_u32(&mut bytes, 0x4c);
+        bytes.extend_from_slice(&[
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ]);
+        push_u32(&mut bytes, 0x2);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 1);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+
+        push_u32(&mut bytes, link_info_size);
+        push_u32(&mut bytes, 0x1c);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 0x1c);
+        push_u32(&mut bytes, local_base_path_offset);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, common_path_suffix_offset);
+        push_u32(&mut bytes, volume_id_size);
+        push_u32(&mut bytes, 3);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, volume_id_size);
+        bytes.extend_from_slice(target_bytes);
+        bytes.push(0);
+        bytes.push(0);
+
+        std::fs::write(path, bytes).expect("write link info shortcut");
     }
 }

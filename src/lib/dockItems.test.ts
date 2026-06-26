@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   addDockItem,
+  addDockItemAt,
   createDefaultDockItems,
   createDockItemInputFromTarget,
+  reorderDockItem,
   searchDockItems,
 } from "./dockItems";
 
@@ -49,6 +51,28 @@ describe("dock item model", () => {
     });
   });
 
+  it("adds a user item at a requested user-visible position", () => {
+    const withProjects = addDockItem(createDefaultDockItems(), {
+      label: "Projects",
+      type: "folder",
+      target: "D:\\Projects",
+    });
+    const withNotion = addDockItem(withProjects, {
+      label: "Notion",
+      type: "app",
+      target: "C:\\Program Files\\Notion\\Notion.exe",
+    });
+
+    const next = addDockItemAt(withNotion, {
+      label: "WeChat",
+      type: "app",
+      target: "C:\\Program Files\\Tencent\\WeChat\\WeChat.exe",
+    }, 1);
+
+    expect(next.map((item) => item.label)).toEqual(["光枢", "WeChat", "Projects", "Notion", "垃圾桶"]);
+    expect(next.map((item) => item.order)).toEqual([0, 1, 2, 3, 4]);
+  });
+
   it("searches by label, type, and target", () => {
     const items = addDockItem(createDefaultDockItems(), {
       label: "Projects",
@@ -84,5 +108,23 @@ describe("dock item model", () => {
       type: "file",
       target: "D:\\Docs\\proposal.final.pdf",
     });
+  });
+
+  it("reorders user dock items without moving fixed launcher and trash items", () => {
+    const withProjects = addDockItem(createDefaultDockItems(), {
+      label: "Projects",
+      type: "folder",
+      target: "D:\\Projects",
+    });
+    const items = addDockItem(withProjects, {
+      label: "Notion",
+      type: "app",
+      target: "C:\\Program Files\\Notion\\Notion.exe",
+    });
+
+    const reordered = reorderDockItem(items, items[2].id, items[1].id);
+
+    expect(reordered.map((item) => item.label)).toEqual(["光枢", "Notion", "Projects", "垃圾桶"]);
+    expect(reordered.map((item) => item.order)).toEqual([0, 1, 2, 3]);
   });
 });

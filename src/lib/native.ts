@@ -59,6 +59,13 @@ export type NativeFileSearchResult = {
   files: NativeFileSearchItem[];
 };
 
+export type NativeDockItemStatus = {
+  target: string;
+  isRunning: boolean;
+  needsAttention: boolean;
+  attentionSequence: number;
+};
+
 const sampleFiles = [
   "screenshot.PNG",
   "proposal.pdf",
@@ -84,7 +91,7 @@ export async function openNativeTarget(target: string): Promise<string> {
     return `浏览器预览：${target}`;
   }
 
-  return invoke<string>("open_target", { target });
+  return invoke<string>("activate_or_open_target", { target });
 }
 
 export async function toggleNativeLauncher(): Promise<string> {
@@ -230,13 +237,37 @@ export async function restoreNativeDesktopFile(currentPath: string, originalPath
   return invoke<void>("restore_desktop_file", { currentPath, originalPath });
 }
 
+export async function getNativeDockItemStatuses(targets: string[]): Promise<NativeDockItemStatus[]> {
+  const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
+
+  if (!isTauriRuntime()) {
+    return cleanTargets.map((target) => ({
+      target,
+      isRunning: false,
+      needsAttention: false,
+      attentionSequence: 0,
+    }));
+  }
+
+  return invoke<NativeDockItemStatus[]>("dock_item_statuses", { targets: cleanTargets });
+}
+
+export async function clearNativeDockItemAttention(target: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+
+  return invoke<void>("clear_dock_item_attention", { target });
+}
+
 type NativeDropOptions = {
-  onEnter?: (paths: string[]) => void;
+  onEnter?: (paths: string[], position?: { x: number; y: number }) => void;
+  onOver?: (position: { x: number; y: number }) => void;
   onLeave?: () => void;
 };
 
 export async function listenForNativeDrops(
-  onDrop: (paths: string[]) => void,
+  onDrop: (paths: string[], position?: { x: number; y: number }) => void,
   options: NativeDropOptions = {},
 ): Promise<() => void> {
   if (!isTauriRuntime()) {
@@ -245,14 +276,27 @@ export async function listenForNativeDrops(
 
   const { getCurrentWebview } = await import("@tauri-apps/api/webview");
   return getCurrentWebview().onDragDropEvent((event) => {
+    const position =
+      "position" in event.payload
+        ? {
+            x: event.payload.position.x / window.devicePixelRatio,
+            y: event.payload.position.y / window.devicePixelRatio,
+          }
+        : undefined;
+
     if (event.payload.type === "enter" && event.payload.paths.length > 0) {
-      options.onEnter?.(event.payload.paths);
+      options.onEnter?.(event.payload.paths, position);
+      return;
+    }
+
+    if (event.payload.type === "over" && position) {
+      options.onOver?.(position);
       return;
     }
 
     if (event.payload.type === "drop") {
       if (event.payload.paths.length > 0) {
-        onDrop(event.payload.paths);
+        onDrop(event.payload.paths, position);
       }
       options.onLeave?.();
       return;
@@ -281,6 +325,15 @@ export async function listenForLauncherFocus(onFocus: () => void): Promise<() =>
 
   const { listen } = await import("@tauri-apps/api/event");
   return listen("lumora://launcher-focus", () => onFocus());
+}
+
+export async function listenForDockAttentionChanges(onChange: () => void): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen("lumora://dock-attention-changed", () => onChange());
 }
 
 function buildCounts(files: NativeDesktopFile[]): NativeDesktopCount[] {

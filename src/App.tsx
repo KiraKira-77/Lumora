@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
-import { DockSurface } from "./components/DockSurface";
+import { DockSurface, type DockInsertIndexResolver, type DockRuntimeStatus } from "./components/DockSurface";
 import { LauncherSurface } from "./components/LauncherSurface";
-import { addDockItem, type DockItem, type NewDockItemInput } from "./lib/dockItems";
+import { addDockItemAt, reorderDockItem, type DockItem, type NewDockItemInput } from "./lib/dockItems";
 import { bindShortcutSlot, type ShortcutSlotTarget } from "./lib/shortcutSlots";
 import {
+  clearNativeDockItemAttention,
   describeNativeTargets,
+  getNativeDockItemStatuses,
   hideNativeDesktopFile,
   hideNativeLauncher,
+  listenForDockAttentionChanges,
   listenForNativeDrops,
   openNativeTarget,
   restoreNativeDesktopFile,
@@ -22,7 +25,7 @@ type AppProps = {
 const emptyDropPayload: string[] = [];
 
 type DropDestination =
-  | { type: "dock" }
+  | { type: "dock"; insertIndex?: number }
   | { type: "shortcut"; key: string };
 
 export default function App({ surface = getWindowSurface() }: AppProps) {
@@ -30,8 +33,10 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
   const [shortcutSlots, setShortcutSlots] = useState(() => loadShortcutSlots());
   const [isDropHot, setIsDropHot] = useState(false);
   const [dropPreviewItems, setDropPreviewItems] = useState<NewDockItemInput[]>([]);
+  const [dockItemStatuses, setDockItemStatuses] = useState<Record<string, DockRuntimeStatus>>({});
   const dropDestinationRef = useRef<DropDestination>({ type: "dock" });
   const dropPreviewRequestRef = useRef(0);
+  const dockInsertIndexResolverRef = useRef<DockInsertIndexResolver | null>(null);
   const [isPreviewLauncherOpen, setIsPreviewLauncherOpen] = useState(true);
 
   useEffect(() => {
@@ -42,7 +47,75 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     saveShortcutSlots(shortcutSlots);
   }, [shortcutSlots]);
 
-  const addTargetsToDock = useCallback(async (targets: string[]) => {
+  const refreshDockItemStatuses = useCallback(async () => {
+    const targets = dockItems.map((item) => item.target).filter(Boolean);
+    if (targets.length === 0) {
+      setDockItemStatuses({});
+      return;
+    }
+
+    const statuses = await getNativeDockItemStatuses(targets);
+    setDockItemStatuses(
+      Object.fromEntries(
+        statuses.map((status) => [
+          status.target,
+          {
+            isRunning: status.isRunning,
+            needsAttention: status.needsAttention,
+            attentionSequence: status.attentionSequence,
+          },
+        ]),
+      ),
+    );
+  }, [dockItems]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    async function refreshIfMounted() {
+      try {
+        await refreshDockItemStatuses();
+      } catch {
+        if (!disposed) {
+          setDockItemStatuses({});
+        }
+      }
+    }
+
+    void refreshIfMounted();
+    const intervalId = window.setInterval(() => {
+      void refreshIfMounted();
+    }, 2000);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [refreshDockItemStatuses]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listenForDockAttentionChanges(() => {
+      void refreshDockItemStatuses();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [refreshDockItemStatuses]);
+
+  const addTargetsToDock = useCallback(async (targets: string[], insertIndex?: number) => {
     const cleanTargets = targets.map((target) => target.trim()).filter(Boolean);
     if (cleanTargets.length === 0) {
       return;
@@ -63,8 +136,16 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       return;
     }
 
-    const inputs = await Promise.all(cleanTargets.map(t => hideNativeDesktopFile(t)));
-    setDockItems((items) => inputs.reduce((next, input) => addDockItem(next, input), items));
+    try {
+      const inputs = await Promise.all(cleanTargets.map(t => hideNativeDesktopFile(t)));
+      setDockItems((items) => {
+        const fallbackIndex = items.findIndex((item) => item.id === "trash");
+        const firstIndex = insertIndex ?? (fallbackIndex >= 0 ? fallbackIndex : items.length);
+        return inputs.reduce((next, input, offset) => addDockItemAt(next, input, firstIndex + offset), items);
+      });
+    } catch (error) {
+      alert(`添加到 Dock 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }, [dockItems]);
 
   const bindTargetToShortcut = useCallback(async (key: string, targets: string[]) => {
@@ -117,25 +198,57 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
         return;
       }
 
-      void addTargetsToDock(targets);
+      void addTargetsToDock(targets, destination.insertIndex);
     },
     [addTargetsToDock, bindTargetToShortcut, clearDropPreview],
   );
+
+  const handleDockInsertIndexResolverChange = useCallback((resolver: DockInsertIndexResolver | null) => {
+    dockInsertIndexResolverRef.current = resolver;
+  }, []);
+
+  function updateDockDropDestinationFromPosition(position?: { x: number; y: number }) {
+    const insertIndex = position ? dockInsertIndexResolverRef.current?.(position.x) : undefined;
+    dropDestinationRef.current = insertIndex === undefined ? { type: "dock" } : { type: "dock", insertIndex };
+  }
+
+  function clearDockAttention(target: string) {
+    setDockItemStatuses((statuses) => {
+      const status = statuses[target];
+      if (!status?.needsAttention) {
+        return statuses;
+      }
+
+      return {
+        ...statuses,
+        [target]: {
+          ...status,
+          needsAttention: false,
+          attentionSequence: 0,
+        },
+      };
+    });
+    void clearNativeDockItemAttention(target);
+  }
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
     void listenForNativeDrops(
-      (paths) => {
+      (paths, position) => {
         setIsDropHot(false);
+        updateDockDropDestinationFromPosition(position);
         handleDroppedTargets(paths);
       },
       {
-        onEnter: (paths) => {
+        onEnter: (paths, position) => {
           setIsDropHot(true);
-          dropDestinationRef.current = { type: "dock" };
+          updateDockDropDestinationFromPosition(position);
           void previewTargetsForDock(paths);
+        },
+        onOver: (position) => {
+          updateDockDropDestinationFromPosition(position);
         },
         onLeave: () => {
           setIsDropHot(false);
@@ -169,6 +282,7 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       return;
     }
 
+    clearDockAttention(item.target);
     await openNativeTarget(item.target);
   }
 
@@ -199,9 +313,12 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
     return textTarget ? [textTarget] : emptyDropPayload;
   }
 
-  function handleDrop(event: DragEvent<HTMLElement>) {
+  function handleDrop(event: DragEvent<HTMLElement>, insertIndex?: number) {
     event.preventDefault();
     setIsDropHot(false);
+    if (insertIndex !== undefined) {
+      dropDestinationRef.current = { type: "dock", insertIndex };
+    }
     handleDroppedTargets(targetsFromBrowserDrop(event));
   }
 
@@ -215,15 +332,25 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
 
   async function handleRemove(item: DockItem) {
     if (item.originalDesktopPath && item.target) {
-      await restoreNativeDesktopFile(item.target, item.originalDesktopPath);
+      try {
+        await restoreNativeDesktopFile(item.target, item.originalDesktopPath);
+      } catch (error) {
+        alert(`移出 Dock 失败，桌面图标未还原：${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
     }
     setDockItems((items) => items.filter((i) => i.id !== item.id));
+  }
+
+  function handleDockReorder(draggedId: string, targetId: string) {
+    setDockItems((items) => reorderDockItem(items, draggedId, targetId));
   }
 
   if (surface === "dock") {
     return (
       <DockSurface
         dockItems={dockItems}
+        dockItemStatuses={dockItemStatuses}
         dropPreviewItems={dropPreviewItems}
         isDropHot={isDropHot}
         onDragStateChange={(isHot) => {
@@ -237,6 +364,8 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
         onRemove={(item) => void handleRemove(item)}
+        onInsertIndexResolverChange={handleDockInsertIndexResolverChange}
+        onReorder={handleDockReorder}
       />
     );
   }
@@ -288,6 +417,7 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
       ) : null}
       <DockSurface
         dockItems={dockItems}
+        dockItemStatuses={dockItemStatuses}
         dropPreviewItems={dropPreviewItems}
         isDropHot={isDropHot}
         onDragStateChange={(isHot) => {
@@ -301,6 +431,8 @@ export default function App({ surface = getWindowSurface() }: AppProps) {
         onDrop={handleDrop}
         onOpen={(item) => void handleOpen(item)}
         onRemove={(item) => void handleRemove(item)}
+        onInsertIndexResolverChange={handleDockInsertIndexResolverChange}
+        onReorder={handleDockReorder}
       />
     </main>
   );

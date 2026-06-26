@@ -54,14 +54,23 @@ export function createDefaultDockItems(): DockItem[] {
 }
 
 export function addDockItem(items: DockItem[], input: NewDockItemInput): DockItem[] {
+  const sorted = sortDockItems(items);
+  const trashIndex = sorted.findIndex((item) => item.id === "trash");
+  return addDockItemAt(items, input, trashIndex >= 0 ? trashIndex : sorted.length);
+}
+
+export function addDockItemAt(items: DockItem[], input: NewDockItemInput, insertIndex: number): DockItem[] {
   const cleanLabel = input.label.trim();
   const cleanTarget = input.target.trim();
   const sorted = sortDockItems(items);
+  const firstUserIndex = sorted.findIndex((item) => !item.pinned);
   const trashIndex = sorted.findIndex((item) => item.id === "trash");
-  const insertIndex = trashIndex >= 0 ? trashIndex : sorted.length;
+  const minInsertIndex = firstUserIndex >= 0 ? firstUserIndex : 1;
+  const maxInsertIndex = trashIndex >= 0 ? trashIndex : sorted.length;
+  const clampedInsertIndex = Math.min(Math.max(insertIndex, minInsertIndex), maxInsertIndex);
 
   const next = [
-    ...sorted.slice(0, insertIndex),
+    ...sorted.slice(0, clampedInsertIndex),
     {
       id: `dock_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       label: cleanLabel,
@@ -70,12 +79,12 @@ export function addDockItem(items: DockItem[], input: NewDockItemInput): DockIte
       glyph: glyphForLabel(cleanLabel),
       tone: toneForType(input.type),
       iconPath: input.iconPath,
-      order: insertIndex,
+      order: clampedInsertIndex,
       pinned: false,
       active: false,
       originalDesktopPath: input.originalDesktopPath,
     },
-    ...sorted.slice(insertIndex),
+    ...sorted.slice(clampedInsertIndex),
   ];
 
   return normalizeDockOrder(next);
@@ -125,6 +134,26 @@ export function moveDockItem(items: DockItem[], id: string, direction: -1 | 1): 
 
   [sorted[index], sorted[nextIndex]] = [sorted[nextIndex], sorted[index]];
   return normalizeDockOrder(sorted);
+}
+
+export function reorderDockItem(items: DockItem[], draggedId: string, targetId: string): DockItem[] {
+  const sorted = sortDockItems(items);
+  const draggedIndex = sorted.findIndex((item) => item.id === draggedId);
+  const targetIndex = sorted.findIndex((item) => item.id === targetId);
+
+  if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) {
+    return sorted;
+  }
+
+  const draggedItem = sorted[draggedIndex];
+  const targetItem = sorted[targetIndex];
+  if (draggedItem.pinned || targetItem.pinned) {
+    return sorted;
+  }
+
+  const withoutDragged = sorted.filter((item) => item.id !== draggedId);
+  withoutDragged.splice(targetIndex, 0, draggedItem);
+  return normalizeDockOrder(withoutDragged);
 }
 
 export function removeDockItem(items: DockItem[], id: string): DockItem[] {

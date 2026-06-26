@@ -102,15 +102,64 @@ button {
   filter: brightness(1.05);
 }
 
-.dock-icon i {
+.dock-running-indicator {
   position: absolute;
   left: 50%;
-  bottom: -8px;
-  width: 4px;
-  height: 4px;
+  bottom: -7px;
+  width: 14px;
+  height: 2px;
   border-radius: 999px;
-  background: oklch(24% 0.014 250 / 0.62);
+  background: oklch(64% 0.012 250 / 0.28);
   transform: translateX(-50%);
+}
+
+.dock-icon.is-attention {
+  background:
+    linear-gradient(180deg, oklch(84% 0.14 68 / 0.88), oklch(72% 0.16 58 / 0.82)),
+    oklch(78% 0.15 62 / 0.86) !important;
+  box-shadow:
+    inset 0 1px 0 oklch(98% 0.02 82 / 0.52),
+    0 10px 22px oklch(42% 0.12 55 / 0.24) !important;
+}
+
+.dock-icon.is-attention .dock-running-indicator {
+  bottom: -8px;
+  width: 34px;
+  height: 3px;
+  background: oklch(71% 0.17 55 / 0.96);
+  box-shadow: 0 0 0 1px oklch(91% 0.08 72 / 0.42);
+}
+
+.dock-icon.is-bouncing.bounce-odd {
+  animation: dock-attention-bounce-odd 820ms cubic-bezier(0.22, 1, 0.36, 1) 1;
+}
+
+.dock-icon.is-bouncing.bounce-even {
+  animation: dock-attention-bounce-even 820ms cubic-bezier(0.22, 1, 0.36, 1) 1;
+}
+
+@keyframes dock-attention-bounce-odd {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+  }
+  18%, 58% {
+    transform: translateY(-13px) scale(1.04);
+  }
+  36%, 76% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes dock-attention-bounce-even {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+  }
+  18%, 58% {
+    transform: translateY(-13px) scale(1.04);
+  }
+  36%, 76% {
+    transform: translateY(0) scale(1);
+  }
 }
 
 .dock-drop-preview {

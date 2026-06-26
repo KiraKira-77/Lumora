@@ -1,19 +1,33 @@
 import type { DragEvent } from "react";
-import { Fragment, useState, useEffect, useRef } from "react";
+import { Fragment, useCallback, useState, useEffect, useRef } from "react";
 import lumoraLogo from "../assets/lumora-logo-256.png";
 import trashGlassmorphism from "../assets/trash-glassmorphism.png";
 import type { DockItem, NewDockItemInput } from "../lib/dockItems";
+import { dockInsertIndexFromPointer } from "../lib/dockDropPosition";
 import { filePathToAssetSrc, updateDockWindowBounds } from "../lib/native";
 
 type DockSurfaceProps = {
   dockItems: DockItem[];
+  dockItemStatuses?: Record<string, DockRuntimeStatus>;
   dropPreviewItems?: NewDockItemInput[];
   isDropHot: boolean;
   onDragStateChange: (isHot: boolean) => void;
-  onDrop: (event: DragEvent<HTMLElement>) => void;
+  onDrop: (event: DragEvent<HTMLElement>, insertIndex: number) => void;
   onOpen: (item: DockItem) => void;
   onRemove: (item: DockItem) => void;
+  onInsertIndexResolverChange?: (resolver: DockInsertIndexResolver | null) => void;
+  onReorder?: (draggedId: string, targetId: string) => void;
 };
+
+export type DockRuntimeStatus = {
+  isRunning: boolean;
+  needsAttention: boolean;
+  attentionSequence: number;
+};
+
+export type DockInsertIndexResolver = (pointerX: number) => number;
+
+const dockDragType = "application/x-lumora-dock-item";
 
 function previewTone(type: NewDockItemInput["type"]): string {
   switch (type) {
@@ -34,15 +48,21 @@ function previewTone(type: NewDockItemInput["type"]): string {
 
 export function DockSurface({
   dockItems,
+  dockItemStatuses = {},
   dropPreviewItems = [],
   isDropHot,
   onDragStateChange,
   onDrop,
   onOpen,
   onRemove,
+  onInsertIndexResolverChange,
+  onReorder,
 }: DockSurfaceProps) {
   const [contextMenu, setContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const navRef = useRef<HTMLElement>(null);
+  const draggedDockItemIdRef = useRef<string | null>(null);
+  const suppressOpenAfterDragRef = useRef(false);
+  const [dropInsertIndex, setDropInsertIndex] = useState<number | null>(null);
 
   useEffect(() => {
     const closeMenu = () => setContextMenu(null);
@@ -63,47 +83,204 @@ export function DockSurface({
     return () => observer.disconnect();
   }, []);
 
+  function isInternalDockDrag(event: DragEvent<HTMLElement>): boolean {
+    return draggedDockItemIdRef.current !== null || Array.from(event.dataTransfer.types).includes(dockDragType);
+  }
+
+  function handleDockItemDragStart(item: DockItem, event: DragEvent<HTMLButtonElement>) {
+    if (item.pinned) {
+      event.preventDefault();
+      return;
+    }
+
+    draggedDockItemIdRef.current = item.id;
+    suppressOpenAfterDragRef.current = true;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(dockDragType, item.id);
+  }
+
+  function handleDockItemDragOver(item: DockItem, event: DragEvent<HTMLButtonElement>) {
+    if (item.pinned || !isInternalDockDrag(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "move";
+  }
+
+  function handleDockItemDrop(item: DockItem, event: DragEvent<HTMLButtonElement>) {
+    if (!isInternalDockDrag(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const draggedId = event.dataTransfer.getData(dockDragType) || draggedDockItemIdRef.current;
+    draggedDockItemIdRef.current = null;
+
+    if (!draggedId || draggedId === item.id || item.pinned) {
+      return;
+    }
+
+    onReorder?.(draggedId, item.id);
+  }
+
+  function handleDockItemDragEnd() {
+    draggedDockItemIdRef.current = null;
+    window.setTimeout(() => {
+      suppressOpenAfterDragRef.current = false;
+    }, 0);
+  }
+
+  const defaultInsertIndex = useCallback((): number => {
+    const trashIndex = dockItems.findIndex((item) => item.id === "trash");
+    return trashIndex >= 0 ? trashIndex : dockItems.length;
+  }, [dockItems]);
+
+  const insertIndexFromPointer = useCallback((pointerX: number): number => {
+    const buttons = Array.from(navRef.current?.querySelectorAll<HTMLElement>("[data-dock-item-id]") ?? []);
+    if (buttons.length !== dockItems.length) {
+      return defaultInsertIndex();
+    }
+
+    return dockInsertIndexFromPointer(
+      dockItems.map((item, index) => {
+        const rect = buttons[index].getBoundingClientRect();
+        return {
+          id: item.id,
+          pinned: item.pinned,
+          left: rect.left,
+          right: rect.right,
+        };
+      }),
+      pointerX,
+    );
+  }, [defaultInsertIndex, dockItems]);
+
+  const updateDropInsertIndex = useCallback((pointerX: number) => {
+    const nextIndex = insertIndexFromPointer(pointerX);
+    setDropInsertIndex(nextIndex);
+    return nextIndex;
+  }, [insertIndexFromPointer]);
+
+  useEffect(() => {
+    onInsertIndexResolverChange?.(updateDropInsertIndex);
+    return () => onInsertIndexResolverChange?.(null);
+  }, [onInsertIndexResolverChange, updateDropInsertIndex]);
+
+  useEffect(() => {
+    if (!isDropHot) {
+      setDropInsertIndex(null);
+    }
+  }, [isDropHot]);
+
+  function renderDropPreviewItems() {
+    return dropPreviewItems.map((preview) => {
+      const previewToneClass = preview.iconPath ? "dock-transparent" : `dock-${previewTone(preview.type)}`;
+      return (
+        <button
+          className={`dock-icon ${previewToneClass} dock-drop-preview`}
+          aria-label={`即将添加 ${preview.label}`}
+          title={`即将添加 ${preview.label}`}
+          key={`${preview.target}-${preview.label}`}
+          type="button"
+        >
+          {preview.iconPath ? (
+            <img className="dock-app-icon" src={filePathToAssetSrc(preview.iconPath)} alt="" aria-hidden="true" />
+          ) : (
+            <span>{preview.label.slice(0, 1).toUpperCase() || "?"}</span>
+          )}
+        </button>
+      );
+    });
+  }
+
+  const previewInsertIndex = dropPreviewItems.length > 0 ? (dropInsertIndex ?? defaultInsertIndex()) : -1;
+
   return (
     <main className="dock-window-surface">
       <nav
         ref={navRef}
         className={`lumora-dock ${isDropHot ? "is-drop-hot" : ""}`}
         aria-label="Lumora Dock"
-        onDragEnter={() => onDragStateChange(true)}
-        onDragOver={(event) => event.preventDefault()}
-        onDragLeave={() => onDragStateChange(false)}
-        onDrop={onDrop}
+        onDragEnter={(event) => {
+          if (isInternalDockDrag(event)) {
+            return;
+          }
+          updateDropInsertIndex(event.clientX);
+          onDragStateChange(true);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          if (!isInternalDockDrag(event)) {
+            updateDropInsertIndex(event.clientX);
+          }
+        }}
+        onDragLeave={(event) => {
+          if (isInternalDockDrag(event)) {
+            return;
+          }
+          onDragStateChange(false);
+          setDropInsertIndex(null);
+        }}
+        onDrop={(event) => {
+          if (isInternalDockDrag(event)) {
+            event.preventDefault();
+            draggedDockItemIdRef.current = null;
+            return;
+          }
+          const insertIndex = updateDropInsertIndex(event.clientX);
+          onDrop(event, insertIndex);
+          setDropInsertIndex(null);
+        }}
       >
-        {dockItems.map((item) => (
+        {dockItems.map((item, index) => {
+          const status = dockItemStatuses[item.target];
+          const attentionSequence = status?.attentionSequence ?? 0;
+          const isAttention = Boolean(status?.needsAttention);
+          const bounceClass =
+            isAttention && attentionSequence > 0
+              ? ` is-bouncing bounce-${attentionSequence % 2 === 0 ? "even" : "odd"}`
+              : "";
+          const itemClassName = `dock-icon ${
+            item.iconPath && item.type !== "launcher"
+              ? "dock-transparent"
+              : item.id === "trash"
+                ? "dock-transparent dock-trash"
+                : `dock-${item.tone}`
+          }${isAttention ? " is-attention" : ""}${bounceClass}`;
+
+          return (
           <Fragment key={item.id}>
+            {index === previewInsertIndex ? renderDropPreviewItems() : null}
             {item.id === "trash" ? (
               <>
-                {dropPreviewItems.map((preview) => {
-                  const previewToneClass = preview.iconPath ? "dock-transparent" : `dock-${previewTone(preview.type)}`;
-                  return (
-                    <button
-                      className={`dock-icon ${previewToneClass} dock-drop-preview`}
-                      aria-label={`即将添加 ${preview.label}`}
-                      title={`即将添加 ${preview.label}`}
-                      key={`${preview.target}-${preview.label}`}
-                      type="button"
-                    >
-                      {preview.iconPath ? (
-                        <img className="dock-app-icon" src={filePathToAssetSrc(preview.iconPath)} alt="" aria-hidden="true" />
-                      ) : (
-                        <span>{preview.label.slice(0, 1).toUpperCase() || "?"}</span>
-                      )}
-                    </button>
-                  );
-                })}
                 <span className="dock-separator" aria-hidden="true" />
               </>
             ) : null}
             <button
-              className={`dock-icon ${item.iconPath && item.type !== "launcher" ? "dock-transparent" : item.id === "trash" ? "dock-transparent dock-trash" : `dock-${item.tone}`}`}
+              className={itemClassName}
               aria-label={item.type === "launcher" ? "光枢" : item.label}
               title={item.label}
-              onClick={() => onOpen(item)}
+              data-dock-item-id={item.id}
+              draggable={!item.pinned}
+              onDragStart={(event) => handleDockItemDragStart(item, event)}
+              onDragEnter={(event) => {
+                if (isInternalDockDrag(event)) {
+                  event.stopPropagation();
+                }
+              }}
+              onDragOver={(event) => handleDockItemDragOver(item, event)}
+              onDrop={(event) => handleDockItemDrop(item, event)}
+              onDragEnd={handleDockItemDragEnd}
+              onClick={(event) => {
+                if (suppressOpenAfterDragRef.current) {
+                  event.preventDefault();
+                  return;
+                }
+                onOpen(item);
+              }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 if (!item.pinned) {
@@ -120,7 +297,7 @@ export function DockSurface({
               ) : (
                 <span>{item.glyph}</span>
               )}
-              {item.active ? <i aria-hidden="true" /> : null}
+              {(status?.isRunning || item.active || isAttention) ? <span className="dock-running-indicator" aria-hidden="true" /> : null}
               
               {contextMenu && contextMenu.id === item.id && (
                 <div 
@@ -172,7 +349,8 @@ export function DockSurface({
               )}
             </button>
           </Fragment>
-        ))}
+          );
+        })}
       </nav>
     </main>
   );
